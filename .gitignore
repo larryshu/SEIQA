@@ -1,0 +1,23 @@
+# 虛擬環境
+.venv/
+.venv-admin/
+
+# Python 快取
+__pycache__/
+*.pyc
+
+# 機密設定 — 絕不進版控
+.env
+*.sqlite3
+
+# 執行期資料（跑起來才產生，不需入庫）
+qdrant_data/
+ui/.sessions/
+ROADMAP.md
+*講稿.md
+*ppt.py
+*.txt
+*.pptx
+# 本機開發工具設定
+.claude/
+

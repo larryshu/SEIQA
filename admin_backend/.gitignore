@@ -1,0 +1,6 @@
+# 機密與本機檔案 — 不進版控
+.env
+*.sqlite3
+__pycache__/
+*.pyc
+/staticfiles/
