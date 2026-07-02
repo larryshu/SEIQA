@@ -46,6 +46,10 @@ class UserPreference(models.Model):
     key = models.CharField(max_length=64)
     value = models.CharField(max_length=512)
     value_type = models.CharField(max_length=16, default="str")  # str/int/float/bool/json
+    # 來源：manual＝後台/API 人工設定；inferred＝登出時 runtime 用 LLM 從對話推論。
+    # runtime 推論永不覆寫 manual（見 app/user_preference.py）。
+    source = models.CharField(max_length=16, default="manual")  # manual | inferred
+    confidence = models.FloatField(null=True, blank=True)  # inferred 的信心（manual 為 NULL）
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

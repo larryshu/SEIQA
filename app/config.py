@@ -52,6 +52,11 @@ class Settings:
     user_memory_top_k: int = _int("USER_MEMORY_TOP_K", 3)
     user_memory_min_score: float = _float("USER_MEMORY_MIN_SCORE", 0.35)
 
+    # ---- 使用者偏好自動推論（登出時從對話萃取設定旋鈕 → user_preference；比 user_memory 保守）----
+    pref_infer_enabled: bool = os.environ.get(
+        "PREF_INFER_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    pref_infer_min_confidence: float = _float("PREF_INFER_MIN_CONFIDENCE", 0.75)
+
     # ---- Dcard 口碑庫（唯讀查詢；資料由 dcard_insight 專案批次建好，這裡只查不寫）----
     insight_collection: str = os.environ.get("INSIGHT_COLLECTION", "dcard_insight").strip()
     search_top_k: int = _int("SEARCH_TOP_K", 5)  # 向量檢索回傳幾則（去重後的貼文數）

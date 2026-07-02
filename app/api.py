@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import FastAPI, Header
 from pydantic import BaseModel
 
-from . import memory_store, user_memory
+from . import memory_store, user_memory, user_preference
 from .agent import run
 from .auth import end_user_id_from_token
 from .config_repo import repo
@@ -40,6 +40,7 @@ class LogoutReq(BaseModel):
 class LogoutResp(BaseModel):
     ok: bool = True
     summarized: int = 0     # 寫進 user_memory 的整段摘要事實條數
+    inferred: int = 0       # 推論寫進 user_preference 的偏好條數
     deleted_rows: int = 0   # 軟刪的 conversation 列數
 
 
@@ -88,6 +89,8 @@ def logout(req: LogoutReq, authorization: str | None = Header(default=None)) -> 
         return LogoutResp(ok=True)  # 匿名：沒有可綁定的記憶/紀錄
     # 1) 整段對話 → 長期記憶（每輪已即時寫過，這裡補一次整體脈絡摘要）
     summarized = user_memory.summarize_and_remember(end_user_id, req.history, req.session_id)
-    # 2) 軟刪這位使用者這段對話的原始紀錄（只鎖 sid + end_user_id）
+    # 2) 整段對話 → 推論『可執行的設定旋鈕』寫進 user_preference（白名單+保守+不覆寫人工設定）
+    inferred = user_preference.infer_and_store(end_user_id, req.history, req.session_id)
+    # 3) 軟刪這位使用者這段對話的原始紀錄（只鎖 sid + end_user_id）
     deleted_rows = memory_store.soft_delete_conversation(req.session_id, end_user_id)
-    return LogoutResp(ok=True, summarized=summarized, deleted_rows=deleted_rows)
+    return LogoutResp(ok=True, summarized=summarized, inferred=inferred, deleted_rows=deleted_rows)

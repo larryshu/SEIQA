@@ -20,4 +20,4 @@ ROADMAP.md
 *.pptx
 # 本機開發工具設定
 .claude/
-
+admin_backend/preferences/migrations/
