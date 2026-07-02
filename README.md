@@ -23,7 +23,7 @@
 8. [.env 參數](#8-env-參數)
 9. [怎麼再加一個平台](#9-怎麼再加一個平台)
 10. [開發里程碑（as-built）](#10-開發里程碑as-built)
-11. [本版不做與關鍵決議](#11-本版不做與關鍵決議)
+<!-- 11. [本版不做與關鍵決議](#11-本版不做與關鍵決議) -->
 
 ---
 
@@ -397,10 +397,10 @@ agent / tools / prompt 都不用動——這就是 registry 的用意。
 
 ---
 
-## 11. 本版不做與關鍵決議
+<!-- ## 11. 本版不做與關鍵決議 -->
 
-**Out of Scope**：方案 B「越用越強」累積記憶（`QdrantHotStore` 預留）、從後台重建 Qdrant 向量庫、多租戶、新平台 adapter 實作（schema 已預留）。
+<!-- **Out of Scope**：方案 B「越用越強」累積記憶（`QdrantHotStore` 預留）、從後台重建 Qdrant 向量庫、多租戶、新平台 adapter 實作（schema 已預留）。 -->
 
-**關鍵決議**：① 終端登入用自管帳密（SSO 為 drop-in）；② 對話歷史收斂到 DB 單一真相（先只寫、後改讀，避免雙真相漂移）；③ 設定生效用短 TTL 快取 + 重載端點；④ 後台前端先用 Django Admin 過渡、DRF API 同步建；⑤ 入口 Django 8000 + Streamlit 側邊欄連結。
+<!-- **關鍵決議**：① 終端登入用自管帳密（SSO 為 drop-in）；② 對話歷史收斂到 DB 單一真相（先只寫、後改讀，避免雙真相漂移）；③ 設定生效用短 TTL 快取 + 重載端點；④ 後台前端先用 Django Admin 過渡、DRF API 同步建；⑤ 入口 Django 8000 + Streamlit 側邊欄連結。 -->
 
 > 完整規格（欄位、API、決議脈絡）見 [`docs/admin_backend_spec.md`](docs/admin_backend_spec.md)。
