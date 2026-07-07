@@ -35,7 +35,7 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 > **同時即時爬 Dcard（DrissionPage 過 Cloudflare）＋ PTT** → 綜合兩邊、帶分平台出處回答。（Dcard 即時爬失敗自動退回向量庫 fallback）
 > 問「一年有幾個月？」→ 判斷不需查 → 直接用常識回答（🟡 黃燈）。
 
-### 面試看點（技術亮點）
+### 技術亮點
 
 - **原生 tool-calling Agent**：不靠框架，LLM 自行規劃是否查、查什麼；`community_search` 一個 skill 對外，內部並行 fan-out 多平台。
 - **雙來源即時爬 + 反爬**：**Dcard 用 DrissionPage 驅動真實 Chrome 過 Cloudflare 即時爬**、PTT 用 requests 即時爬，**「兩邊都查」是程式層保證**；Dcard 另備離線向量庫當 fallback（即時爬失敗自動退回）。
