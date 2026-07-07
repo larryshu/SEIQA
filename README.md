@@ -6,7 +6,7 @@
 | 項目 | 內容 |
 |---|---|
 | 定位 | tool-calling 的**多平台社群口碑問答 Agent** + 可設定化後台 |
-| 技術棧 | 前台 runtime：FastAPI · PyMySQL · PyJWT · Qdrant · Azure OpenAI；後台：Django 5 · DRF · MySQL 8；前端：Streamlit |
+| 技術棧 | 前台 runtime：FastAPI · PyMySQL · PyJWT · DrissionPage（Dcard 反爬即時爬）· Qdrant · Azure OpenAI；後台：Django 5 · DRF · MySQL 8；前端：Streamlit |
 | 狀態 | M0–M6 + 終端登入 + 使用者長期記憶/登出 + 偏好自動推論 **皆已實作（as-built）**，並通過真實 LLM 端到端驗證 |
 
 ---
@@ -16,7 +16,7 @@
 1. [專案簡介與亮點](#1-專案簡介與亮點)
 2. [系統組成（三個服務）與整體架構](#2-系統組成三個服務與整體架構)
 3. [Agent 與檢索設計](#3-agent-與檢索設計)
-4. [記憶與偏好（四層）](#4-記憶與偏好四層)
+4. [記憶（三層）與偏好](#4-記憶三層與偏好)
 5. [後台管理系統（Django + DRF）](#5-後台管理系統django--drf)
 6. [專案結構](#6-專案結構)
 7. [快速開始](#7-快速開始)
@@ -32,17 +32,17 @@
 tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LLM 用 tool calling 自己決定何時呼叫外部工具」的模式，但用既有 Azure OpenAI 技術棧原生實作（不引入 Hermes 平台）。
 
 > 你問「遠距離戀愛可以維持嗎？」→ Agent 判斷需要鄉民口碑 → 呼叫 `community_search` →
-> **同時**查 Dcard 口碑庫（向量庫）＋ 即時爬 PTT → 綜合兩邊、帶分平台出處回答。
+> **同時即時爬 Dcard（DrissionPage 過 Cloudflare）＋ PTT** → 綜合兩邊、帶分平台出處回答。（Dcard 即時爬失敗自動退回向量庫 fallback）
 > 問「一年有幾個月？」→ 判斷不需查 → 直接用常識回答（🟡 黃燈）。
 
 ### 面試看點（技術亮點）
 
 - **原生 tool-calling Agent**：不靠框架，LLM 自行規劃是否查、查什麼；`community_search` 一個 skill 對外，內部並行 fan-out 多平台。
-- **雙來源混合檢索**：離線向量庫（Dcard）＋ 線上即時爬（PTT），**「兩邊都查」是程式層保證**，不靠 LLM 記得叫兩個工具。
-- **Registry + adapter 擴充性**：加平台＝多寫一個 adapter，agent / prompt / loop 全不動。
+- **雙來源即時爬 + 反爬**：**Dcard 用 DrissionPage 驅動真實 Chrome 過 Cloudflare 即時爬**、PTT 用 requests 即時爬，**「兩邊都查」是程式層保證**；Dcard 另備離線向量庫當 fallback（即時爬失敗自動退回）。
+- **Registry + adapter 擴充性**：加平台＝多寫一個 adapter，agent / prompt / loop 全不動；連 Dcard 的「即時爬↔向量庫」切換也靠這層乾淨接起來（`DCARD_MODE`）。
 - **設定資料庫化**：prompt / 模型 / 平台開關 / 檢索門檻全搬進 MySQL，後台改設定**免改程式碼**；runtime 唯讀讀取 + 短 TTL 快取。
-- **全域 fail-safe**：任一來源（embed / Qdrant / PTT）或後台 DB 掛掉，只降級不中斷；兩邊都空 → 誠實退回常識（🟡 黃燈），反幻覺。
-- **三層記憶 + 偏好自動推論**：對話落地、跨 session 語意記憶、登出時 LLM 從對話**自動學習可執行偏好**（白名單 + 保守門檻 + 不覆寫人工設定）。
+- **全域 fail-safe（分層）**：Dcard 即時爬掛了退向量庫、PTT 掛了只少 PTT、任一來源 embed/Qdrant/後台 DB 出事只降級不中斷；兩邊都空 → 誠實退回常識（🟡 黃燈），反幻覺。
+- **三層記憶（長期層雙軌）+ 偏好自動推論**：短期檢索快取、中期對話落地、長期使用者記憶（**事實點狀召回 ＋ 脈絡敘事重載 / episodic 雙軌**）；登出時 LLM 另從對話**自動學習可執行偏好**（白名單 + 保守門檻 + 不覆寫人工設定）。
 - **完整後台**：四模組（agent / 帳戶 / 記憶 / 偏好）、RBAC（admin/editor/viewer）、稽核、JWT 雙身分（操作者 vs 終端使用者）。
 - **SQL 優化實績**：N+1 修正（31→2、21→2 查詢）、複合索引消除 filesort、對話列表分頁對齊索引。
 
@@ -63,8 +63,8 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
                                     │
                           ┌─────────┴─────────┐
                      [MySQL]              [Qdrant]
-                  關聯資料：設定、         向量本體：
-                  帳戶、對話、metadata     Dcard 口碑庫（唯讀）
+                  關聯資料：設定、         向量本體：使用者長期記憶
+                  帳戶、對話、metadata     ＋ Dcard fallback 向量庫（唯讀）
 ```
 
 **架構定案要點：**
@@ -88,37 +88,43 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 
 | adapter | 平台 | 方式 | 反爬 |
 |---|---|---|---|
-| `DcardSource` | Dcard | 查向量庫 `dcard_insight`（語意檢索，唯讀） | 無（離線已建庫） |
+| `DcardLiveSource` | Dcard | **DrissionPage 即時爬**：LLM 抽關鍵字 → 全站「文章」搜尋 → 時間預算內深挖內文/留言；失敗→退回向量庫 | Cloudflare：DrissionPage 驅動真實 Chrome + 持久設定檔養 `cf_clearance` |
+| `DcardSource` | Dcard（fallback） | 查向量庫 `dcard_insight`（語意檢索，唯讀）；`DCARD_MODE=vector` 也可強制走這條 | 無（離線已建庫） |
 | `PttSource` | PTT | 即時爬站內搜尋（時間預算內邊翻邊抓） | 無 Cloudflare，帶 `over18` cookie 即可 |
 
-> Dcard 為何不即時爬：站內搜尋會被 Cloudflare 阻擋，故改查已建好的向量庫。
+> **Dcard 的演進**：一開始因站內搜尋被 Cloudflare 擋，改用離線向量庫（穩定、唯讀）；後來用 DrissionPage 攻克 Cloudflare、升級成即時爬拿最新討論，**向量庫保留當 fallback**。`DCARD_MODE=live`（預設，即時爬＋fallback）／`vector`（純向量庫）。
 
 ### 3.2 設計決策
 
-- **Dcard＝向量庫（唯讀）＋多面向檢索**：問句 embedding 後查 `dcard_insight`（3529 筆、1536 維 / Cosine）。先請 LLM 改寫成數條「鄉民用詞」面向查詢（`SEARCH_EXPAND_N`），各查一次後 **round-robin 合併**，避免單一稠密向量被強勢詞綁架；低於門檻（`SEARCH_MIN_SCORE`）視為不夠對題。
+- **Dcard＝即時爬（DrissionPage）＋向量庫 fallback**：LLM 先把問句抽成關鍵字（不用選版），開全站「文章」搜尋 `/search/posts`；貼文改用 `globalPaging` 端點載入（自行重放會 403），故用 `page.listen` 攔截網頁自己發的回應。搜回相關文後，在 `DCARD_TIME_BUDGET`（預設 100s）內逐篇進頁抓內文＋熱門留言，到時就停、回已抓到的（單例瀏覽器 + 鎖、留言掃描上限控成本）。**即時爬失敗/沒結果 → 自動退回向量庫**（`dcard_insight` 3529 筆、多面向查詢改寫 `SEARCH_EXPAND_N` + round-robin + `SEARCH_MIN_SCORE` 門檻，避免單一稠密向量被強勢詞綁架）。
 - **PTT＝即時爬＋時間預算**：LLM 一次決定（看板 + 多個『單一關鍵詞』）——PTT 多詞是 AND 比對標題（「外型 情緒穩定」→ 0 筆），故抽成多個單詞各搜再合併。翻搜尋頁『邊翻邊抓』，到 `PTT_TIME_BUDGET`（預設 60s）就停；全程禮貌限速避免被 ban。
 - **檢索快取＝方案 A（預設）**：查到的社群資料只進**當次 session 記憶體**（`SessionFreshStore`），用完即丟。業務只認 `FreshStore` 抽象。
 - **燈號＝來源透明**：有撈到社群討論 → 🟢 綠燈＋標各平台則數＋來源 `[n]`；都沒撈到（或不需查）→ 🟡 黃燈，誠實標為 LLM 既有常識。
-- **fail-safe**：任一平台（embed/Qdrant/PTT）失敗只少那一邊，不影響其他來源；兩邊都空就退回常識回答。
+- **fail-safe（分層）**：Dcard 即時爬失敗自動退向量庫；PTT 失敗只少 PTT；任一平台 embed/Qdrant 出事只影響那一邊；兩邊都空就退回常識回答。
 - **工具＝skill**：`tools.py` 的 `description` 寫清楚「何時該用」＝觸發條件，等同 Hermes skill 的 trigger。
 
 ---
 
-## 4. 記憶與偏好（四層）
+## 4. 記憶（三層）與偏好
 
-| 層 | 存哪 | 存什麼 | 生命週期 |
+**記憶分三層（短 / 中 / 長期）；長期層再分「事實」與「脈絡」雙軌。偏好不是記憶、而是「指令性設定」，故另計。**
+
+| 記憶層 | 存哪 | 存什麼 | 生命週期 |
 |---|---|---|---|
-| 檢索快取（方案 A）| 程序記憶體 `SessionFreshStore` | 當次查到的社群貼文 | 當次 session，用完即丟 |
-| 對話紀錄 | 後台 MySQL `conversation` / `message` | 每輪 Q/A（`memory_store.persist_turn`）| 落地保存、可在後台檢視；登出軟刪 |
-| 使用者長期記憶 | Qdrant `user_memory` collection | LLM 萃取的「關於使用者本人的長期事實」（`user_memory.py`）| 跨 session 保留，**僅登入者** |
-| 使用者偏好（自動推論）| 後台 MySQL `user_preference` | LLM 從對話萃取的「可執行設定旋鈕」：語氣/長度/語言/平台過濾（`user_preference.py`）| 登出時推論寫入、跨 session；依優先序套用，**僅登入者** |
+| **短期**・檢索快取（方案 A）| 程序記憶體 `SessionFreshStore` | 當次查到的社群貼文 | 當次 session，用完即丟 |
+| **中期**・對話紀錄 | 後台 MySQL `conversation` / `message` | 每輪 Q/A（`memory_store.persist_turn`）| 落地保存、可在後台檢視；登出軟刪 |
+| **長期・事實**（atomic）| Qdrant `user_memory`（`kind=turn/session_summary`）| LLM 萃取「關於使用者本人的穩定事實」；**點狀語意召回**（`recall`，門檻 0.35）| 跨 session 保留，**僅登入者** |
+| **長期・脈絡**（thread / episodic）| Qdrant `user_memory`（`kind=thread`）| 登出時把整場對話濃縮成**一筆有脈絡敘事**（headline 檢索／narrative 重載）；相關問題**整段重載**（`recall_threads`，門檻 0.42）| 跨 session 保留，**僅登入者** |
 
-- **記憶 vs 偏好**：`user_memory`（Qdrant）記「描述性」自由文字事實、語意召回個人化**內容**；`user_preference`（MySQL）記「指令性」設定旋鈕、runtime 用精確 key **確定性改變行為**。兩者寫入路徑獨立。
+> **偏好（`user_preference`，另計，不併入記憶層數）**：LLM 從對話推論的「可執行設定旋鈕」（語氣/長度/語言/model/平台過濾），登出寫入 MySQL、跨 session；runtime 用精確 key **確定性改變行為**。與上面「描述性記憶」是兩回事。
+
+- **記憶 vs 偏好**：`user_memory`（Qdrant）記「描述性」自由文字（事實／脈絡）、語意召回個人化**內容**；`user_preference`（MySQL）記「指令性」設定旋鈕、runtime 用精確 key **確定性改變行為**。兩者寫入路徑獨立。
+- **事實記憶 vs 脈絡記憶**：同一個 `user_memory` collection 用 `kind` 分兩軌——**事實**（原子、第三人稱一句話，點狀召回填個人化背景）與 **脈絡（thread / episodic）**（整場對話的敘事梗概，headline 當檢索鍵、narrative 重載，讓相關新問題能喚回上次討論到哪）；thread 走 `recall_threads` 注入獨立的「先前相關對話的脈絡」區塊，門檻（0.42）比事實（0.35）高，避免鬆散舊脈絡灌爆 prompt。
 - **偏好推論比記憶保守**（因為會確定性且靜默地改變行為，例如誤設 `excluded_platforms` 會默默關掉資料源）：只收白名單 key、值域受限、過信心門檻（`PREF_INFER_MIN_CONFIDENCE`，預設 0.75），且 `source='manual'` 的人工設定**永不被覆寫**。
 - **取值優先序**（runtime 解析）：`user_preference` > `agent` > `system_setting`。
 - **只有登入使用者**才有長期記憶與對話歸戶；匿名照常能問答但不留記憶。全程 fail-safe：記憶那層炸掉也不影響回答。
 
-**登入 / 登出流程（as-built）**：Streamlit 向 Django `end-auth` 拿 JWT（共用 `TOKEN_SECRET`、HS256），聊天帶 `Authorization: Bearer`；runtime 驗證取 `end_user_id`（失敗即匿名）。**登出**（`POST /logout`）把整段對話 ①摘要成長期事實寫入 `user_memory`、②推論可執行偏好寫入 `user_preference`、③軟刪原始對話，回 `{ok, summarized, inferred, deleted_rows}`。
+**登入 / 登出流程（as-built）**：Streamlit 向 Django `end-auth` 拿 JWT（共用 `TOKEN_SECRET`、HS256），聊天帶 `Authorization: Bearer`；runtime 驗證取 `end_user_id`（失敗即匿名）。**登出**（`POST /logout`）把整段對話 ①摘要成長期事實**＋一筆脈絡敘事（thread）**寫入 `user_memory`、②推論可執行偏好寫入 `user_preference`、③軟刪原始對話，回 `{ok, summarized, inferred, deleted_rows}`（`summarized` 含事實與 thread 條數）。
 
 > 詳細機制（每輪萃取、meta 問題列表、payload 備查、四道護欄）見 [`admin_backend_spec.md` §8.1–8.3](docs/admin_backend_spec.md#81-終端登入與-token-驗證as-built)。
 
@@ -294,11 +300,12 @@ GRANT SELECT, INSERT, UPDATE ON <db>.user_preference  TO 'crawl_rw'@'<host>';
 ```
 SEIQA/
 ├─ app/                     # FastAPI runtime（agent + 唯讀 MySQL 讀取層）
-│   config.py               # .env 設定（LLM / Qdrant / 口碑庫 / PTT / MySQL / 記憶 / 偏好）
+│   config.py               # .env 設定（LLM / Qdrant / Dcard 即時爬 / PTT / MySQL / 記憶 / 偏好）
 │   llm.py                  # LLM 客戶端：chat() / chat_with_tools() / embed() / expand_queries()
-│   vectorstore.py          # Dcard 口碑庫向量檢索（Qdrant REST，多面向 + 門檻）
+│   dcard_live.py           # Dcard 即時爬（DrissionPage 過 Cloudflare：全站文章搜尋 + 深挖內文/留言 + 時間預算）
+│   vectorstore.py          # Dcard fallback 向量檢索（Qdrant REST，多面向 + 門檻；即時爬失敗時用）
 │   ptt.py                  # PTT 即時爬蟲（requests + bs4，over18 + 時間預算 + 限速 + 重試）
-│   sources.py              # 來源 registry：Source 抽象 + DcardSource/PttSource + 並行 fan-out
+│   sources.py              # 來源 registry：Source 抽象 + DcardLiveSource(→向量 fallback)/PttSource + 並行 fan-out
 │   store.py                # FreshStore 抽象 + SessionFreshStore(A) + QdrantHotStore(B 預留)
 │   tools.py                # 單一 skill：community_search
 │   agent.py                # 規劃→工具→行動 的多輪 loop
@@ -319,7 +326,10 @@ SEIQA/
 
 ## 7. 快速開始
 
-**前置**：Qdrant 跑著、`dcard_insight` 已有資料、`EMBED_MODEL` 與建庫時同一模型（`text-embedding-3-small`，1536 維）；PTT 免設定。
+**前置**：
+- **Dcard 即時爬（`DCARD_MODE=live`，預設）**：本機裝有 Google Chrome；設 `DCARD_USER_DATA_DIR` 持久設定檔養 `cf_clearance` 過 Cloudflare（首次可能需在彈出視窗手動點一次盾）。需有桌面環境（有頭瀏覽器）。
+- **Dcard fallback / `DCARD_MODE=vector`**：Qdrant 跑著、`dcard_insight` 已有資料、`EMBED_MODEL` 與建庫時同一模型（`text-embedding-3-small`，1536 維）。
+- PTT 免設定。
 
 **只跑問答 runtime（最小；不需 MySQL / 後台）**
 
@@ -341,7 +351,7 @@ python -m venv .venv-admin
 .\start.ps1                                                  # Django 8000 + FastAPI 8001 + Streamlit 8501
 ```
 
-**測試**：Swagger UI（http://localhost:8001/docs）／ curl `POST /ask` ／ Streamlit 前端。回覆上方標「🟢 Dcard X 則 / PTT Y 則」或「🟡 LLM 既有常識」。含 PTT 即時爬時一題最久 ≈ `PTT_TIME_BUDGET` 秒。
+**測試**：Swagger UI（http://localhost:8001/docs）／ curl `POST /ask` ／ Streamlit 前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則」或「🟡 LLM 既有常識」。兩來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET)` 秒（非相加）。
 
 ---
 
@@ -350,14 +360,30 @@ python -m venv .venv-admin
 ```
 EMBED_MODEL=text-embedding-3-small   # 須與建 dcard_insight 時同一個模型
 QDRANT_URL=http://localhost:7333
-INSIGHT_COLLECTION=dcard_insight     # Dcard 口碑庫 collection
-SEARCH_TOP_K=5 / SEARCH_EXPAND_N=3 / SEARCH_MIN_SCORE=0.5   # Dcard 檢索：則數 / 改寫條數 / 門檻
+INSIGHT_COLLECTION=dcard_insight     # Dcard fallback 向量庫 collection
+
+# --- Dcard 即時爬（DrissionPage）---
+DCARD_MODE=live                      # live=即時爬（失敗自動退向量庫）／vector=純向量庫
+DCARD_TIME_BUDGET=100                # 即時爬時間預算（秒），到時回已抓到的
+DCARD_DEEP_MAX=18                    # 最多深挖幾篇（進頁抓內文+留言）
+DCARD_MAX_COMMENTS=20 / DCARD_COMMENT_SCAN_MAX=50  # 每篇取前幾則留言 / 掃描上限（控成本）
+DCARD_HEADLESS=0                     # 有頭才過得了 Cloudflare（須桌面環境）
+DCARD_USER_DATA_DIR=...              # 持久 Chrome 設定檔：養 cf_clearance 跨次重用
+# DCARD_COOKIE / DCARD_USER_AGENT    # 替代方案：貼同一瀏覽器的 cookie+UA
+
+# --- Dcard fallback 向量檢索（DCARD_MODE=vector 或即時爬失敗時）---
+SEARCH_TOP_K=5 / SEARCH_EXPAND_N=3 / SEARCH_MIN_SCORE=0.5   # 則數 / 改寫條數 / 門檻
 PTT_TIME_BUDGET=60                   # PTT 即時爬時間預算（秒）
 PTT_MIN_DELAY=0.5 / PTT_MAX_DELAY=1.0  # PTT 禮貌限速
 
-# --- 個人化長期記憶（僅登入者；fail-safe）---
+# --- 個人化長期記憶：事實（僅登入者；fail-safe）---
 USER_MEMORY_ENABLED=true / USER_MEMORY_COLLECTION=user_memory
 USER_MEMORY_TOP_K=3 / USER_MEMORY_MIN_SCORE=0.35            # 撈回條數 / 召回門檻
+
+# --- 脈絡記憶（thread / episodic；登出存整場敘事，相關問題重載；僅登入者）---
+USER_THREAD_ENABLED=true            # 關掉即不存/不重載脈絡敘事
+USER_THREAD_TOP_K=2 / USER_THREAD_MIN_SCORE=0.42           # 重載筆數 / 召回門檻（比事實高）
+USER_THREAD_MAX_CHARS=1200          # 單筆敘事注入 prompt 的長度上限
 
 # --- 使用者偏好自動推論（登出時萃取設定旋鈕 → user_preference；比長期記憶保守）---
 PREF_INFER_ENABLED=true              # 關掉即不自動推論偏好

@@ -52,6 +52,15 @@ class Settings:
     user_memory_top_k: int = _int("USER_MEMORY_TOP_K", 3)
     user_memory_min_score: float = _float("USER_MEMORY_MIN_SCORE", 0.35)
 
+    # ---- 使用者脈絡記憶（thread / episodic；登出時把整場對話存成有脈絡敘事，相關問題重載）----
+    # 與原子事實並存：事實管點狀召回，thread 管脈絡重載。只記使用者處境/目標/提問走向，不記世界結論。
+    user_thread_enabled: bool = os.environ.get(
+        "USER_THREAD_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    user_thread_top_k: int = _int("USER_THREAD_TOP_K", 2)
+    # 門檻比事實（0.35）高：整段敘事要夠對題才注入，避免鬆散舊脈絡灌爆 system prompt
+    user_thread_min_score: float = _float("USER_THREAD_MIN_SCORE", 0.42)
+    user_thread_max_chars: int = _int("USER_THREAD_MAX_CHARS", 1200)  # 注入單筆敘事長度上限（含討論重點梗概故拉高）
+
     # ---- 使用者偏好自動推論（登出時從對話萃取設定旋鈕 → user_preference；比 user_memory 保守）----
     pref_infer_enabled: bool = os.environ.get(
         "PREF_INFER_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -69,6 +78,30 @@ class Settings:
     ptt_time_budget: int = _int("PTT_TIME_BUDGET", 60)   # 秒；翻搜尋頁逐篇抓的時間預算，到時就停回已抓到的
     ptt_min_delay: float = _float("PTT_MIN_DELAY", 0.5)  # 秒；禮貌限速下限（避免被 ban）
     ptt_max_delay: float = _float("PTT_MAX_DELAY", 1.0)  # 秒；禮貌限速上限
+
+    # ---- Dcard 即時爬（DrissionPage / DcardLiveSource）----
+    # DCARD_MODE=live → 走 DrissionPage 即時爬（全站『文章』搜尋），失敗/空自動 fallback 向量庫；
+    # DCARD_MODE=vector → 走 Dcard 口碑庫向量檢索（原本行為，程式碼保留不動）。
+    dcard_mode: str = os.environ.get("DCARD_MODE", "live").strip().lower()
+    dcard_time_budget: int = _int("DCARD_TIME_BUDGET", 100)   # 秒；即時爬硬上限，到時回已抓到的（須 < 前端 300s）
+    dcard_deep_max: int = _int("DCARD_DEEP_MAX", 18)          # 最多深挖幾篇（進頁抓內文+留言）
+    dcard_max_comments: int = _int("DCARD_MAX_COMMENTS", 20)  # 每篇留言取前幾則（依讚數，濾掉貼圖/純網址後）
+    dcard_headless: bool = os.environ.get(
+        "DCARD_HEADLESS", "0").strip().lower() in ("1", "true", "yes", "on")  # 有頭才過得了 Cloudflare
+    dcard_cookie: str = os.environ.get("DCARD_COOKIE", "").strip()            # 選填：cf_clearance 等整串 cookie
+    dcard_user_agent: str = os.environ.get("DCARD_USER_AGENT", "").strip()    # 選填：須與 cookie 同一瀏覽器
+    dcard_user_data_dir: str = os.environ.get("DCARD_USER_DATA_DIR", "").strip()  # 持久設定檔：養 cf_clearance 跨次重用
+    dcard_cf_timeout: int = _int("DCARD_CF_TIMEOUT", 90)         # 秒；等 Cloudflare 挑戰解開逾時
+    dcard_request_timeout: int = _int("DCARD_REQUEST_TIMEOUT", 25)  # 秒；等單一頁面/回應逾時
+    dcard_min_delay: float = _float("DCARD_MIN_DELAY", 1.0)      # 秒；捲動/翻頁間隔下限
+    dcard_max_delay: float = _float("DCARD_MAX_DELAY", 2.0)      # 秒；捲動/翻頁間隔上限
+    dcard_post_delay_min: float = _float("DCARD_POST_DELAY_MIN", 1.5)  # 秒；每篇貼文之間停頓下限（降 CF 觸發）
+    dcard_post_delay_max: float = _float("DCARD_POST_DELAY_MAX", 3.0)  # 秒；每篇貼文之間停頓上限
+    dcard_scroll_stale_limit: int = _int("DCARD_SCROLL_STALE_LIMIT", 5)   # 搜尋頁連續幾次捲動無新資料就停
+    dcard_comment_stale_limit: int = _int("DCARD_COMMENT_STALE_LIMIT", 2)  # 留言連續幾次捲動無新就停（壓延遲）
+    # 每篇最多掃描幾則留言就停：熱門文動輒數百則，但我們只取前 dcard_max_comments 則熱門，
+    # 掃到這個量已足以涵蓋高讚留言，不必捲完全部（否則一篇熱門文就吃光整個時間預算）。
+    dcard_comment_scan_max: int = _int("DCARD_COMMENT_SCAN_MAX", 80)
 
     # ---- 後台共用 MySQL（M3：唯讀讀設定；db_host 留空＝停用，全走上面的 .env/寫死值）----
     db_host: str = os.environ.get("DB_HOST", "").strip()

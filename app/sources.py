@@ -54,6 +54,31 @@ class DcardSource(Source):
         return vectorstore.multi_search(queries, top_k=top_k, min_score=min_score)
 
 
+class DcardLiveSource(Source):
+    """Dcard 即時爬（DrissionPage 全站『文章』搜尋）。DCARD_MODE=live 時走這條。
+
+    即時爬失敗 / 沒撈到（Cloudflare 擋、DrissionPage 未裝、無結果…）→ 自動 fallback 到
+    向量庫（DcardSource），確保 Dcard 這條總是回得了話。輸出仍是 source="dcard" 的 Post，
+    前端 [n] 引用與燈號完全沿用，不用改。
+    """
+
+    name = "dcard"
+
+    def __init__(self, cfg: dict | None = None) -> None:
+        super().__init__(cfg)
+        self._vector = DcardSource(cfg)  # fallback
+
+    def fetch(self, query: str) -> list[Post]:
+        from . import dcard_live  # lazy：DrissionPage 沒裝也不影響 app 啟動
+        time_budget = int(self.cfg.get("time_budget", settings.dcard_time_budget))
+        deep_max = int(self.cfg.get("deep_max", settings.dcard_deep_max))
+        posts = dcard_live.crawl(query, max_posts=deep_max, time_budget=time_budget)
+        if posts:
+            return posts
+        logger.info("Dcard 即時爬無結果，fallback 向量庫")
+        return self._vector.fetch(query)
+
+
 class PttSource(Source):
     """PTT：挑看板後在時間預算內即時爬站內搜尋結果。"""
 
@@ -64,11 +89,21 @@ class PttSource(Source):
         return ptt.search(query, time_budget=time_budget)
 
 
+def _dcard_cls() -> type[Source]:
+    """DCARD_MODE 決定 Dcard 這條走哪個 adapter：live=即時爬（+向量 fallback）｜vector=純向量庫。"""
+    return DcardLiveSource if settings.dcard_mode == "live" else DcardSource
+
+
 # adapter_key（後台 source_platform.adapter_key）→ adapter 類別。加平台就在這裡多掛一個。
-_ADAPTERS: dict[str, type[Source]] = {"dcard": DcardSource, "ptt": PttSource}
+# 「dcard」依 DCARD_MODE 解析成即時爬或向量；後台若另設 adapter_key=dcard_vector 可強制走向量。
+_ADAPTERS: dict[str, type[Source]] = {
+    "dcard": _dcard_cls(),
+    "dcard_vector": DcardSource,
+    "ptt": PttSource,
+}
 
 # fallback：後台不可用時用的預設（等同 M3 之前的寫死 registry）
-_DEFAULT_REGISTRY: list[Source] = [DcardSource(), PttSource()]
+_DEFAULT_REGISTRY: list[Source] = [_dcard_cls()(), PttSource()]
 
 # 對外相容：保留 REGISTRY 名稱（指向預設）
 REGISTRY: list[Source] = _DEFAULT_REGISTRY

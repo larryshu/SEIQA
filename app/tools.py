@@ -1,6 +1,6 @@
 """工具定義 + 分派。對應 Hermes 的「skill」：LLM 用 tool calling 自己決定何時呼叫。
 
-對 LLM 只暴露一個 skill：community_search —— 內部並行 fan-out 到 Dcard 口碑庫 + 即時爬 PTT，
+對 LLM 只暴露一個 skill：community_search —— 內部並行 fan-out 到 Dcard + PTT（皆即時爬），
 合併兩邊討論（各帶平台標籤）。各平台的 adapter 在 sources.py 的 registry，加平台只要加 adapter、
 不動這裡。如此「兩邊一定都查」是程式保證的，不靠 LLM 記得同時叫兩個工具。
 
@@ -14,7 +14,7 @@ from . import crawler
 from .sources import community_search as _fanout_search
 from .store import store
 
-_PLATFORM_LABEL = {"dcard": "Dcard 口碑庫", "ptt": "PTT"}
+_PLATFORM_LABEL = {"dcard": "Dcard", "ptt": "PTT"}
 
 # 給 LLM 看的工具清單（function calling schema）。description 寫清楚「何時該用」＝觸發條件。
 TOOLS: list[dict] = [
@@ -23,7 +23,7 @@ TOOLS: list[dict] = [
         "function": {
             "name": "community_search",
             "description": (
-                "查網路社群討論：會『同時』查 Dcard 口碑庫與即時爬 PTT，撈與使用者問題相關的"
+                "查網路社群討論：會『同時』即時爬 Dcard 與 PTT，撈與使用者問題相關的"
                 "鄉民口碑／心得／評價／經驗／時事討論。當問題需要鄉民實際討論"
                 "（感情、理財、3C 評價、工作、時事、產品心得等）時呼叫此工具；"
                 "純常識、定義、計算等不需鄉民經驗就能回答時，不要呼叫、直接回答即可。"
@@ -68,14 +68,14 @@ def dispatch(name: str, arguments: str, session_id: str,
 
 def _community_search(query: str, session_id: str, sources: list | None = None,
                       end_user_id: int | None = None) -> str:
-    """並行查 Dcard 口碑庫 + PTT，合併兩邊討論。沒命中→請 LLM 退回常識。
+    """並行查 Dcard + PTT，合併兩邊討論。沒命中→請 LLM 退回常識。
 
     end_user_id：有的話，平台會依該使用者的 included/excluded_platforms 偏好過濾（M5）。
     """
     posts = _fanout_search(query, end_user_id=end_user_id)
     if not posts:
         return (
-            "（Dcard 口碑庫與 PTT 都沒有相關討論。請改用你既有的常識／經驗回答，"
+            "（Dcard 與 PTT 都沒有相關討論。請改用你既有的常識／經驗回答，"
             "並自然地說一句這次沒在社群找到相關討論，不要杜撰來源。）"
         )
     store.save(session_id, posts)

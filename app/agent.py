@@ -1,7 +1,7 @@
 """Agent loop：LLM ↔ 工具的多輪循環（規劃→工具→行動），借鑑 Hermes 的自主工具呼叫。
 
 流程：把 system + 對話歷史 + 提問丟給 LLM →
-  - 它若決定要最新資訊 → 回 tool_calls → 我們執行 crawl_dcard → 把結果塞回 →再問一次
+  - 它若決定要最新資訊 → 回 tool_calls → 我們執行 community_search（並行即時爬 Dcard+PTT）→ 把結果塞回 →再問一次
   - 它若覺得夠了 → 直接回文字答案
 fail-safe：工具炸掉/沒結果，crawler 與 tools 已各自吞例外，最終一定回得了話。
 """
@@ -15,7 +15,7 @@ from .tools import TOOLS, dispatch
 SYSTEM_PROMPT = (
     "你是一個熟悉網路鄉民討論的貼心朋友，不是制式的查詢助理。"
     "當問題需要鄉民民間討論／口碑／心得／時事時，用 community_search 工具——"
-    "它會『同時』查 Dcard 口碑庫與即時 PTT，把兩邊討論一起撈回來。"
+    "它會『同時』即時爬 Dcard 與 PTT，把兩邊討論一起撈回來。"
     "純常識、定義、計算等不需要鄉民經驗的問題，直接回答即可、不用查。"
     "\n\n"
     "【回答方式——這是重點】"
@@ -27,7 +27,7 @@ SYSTEM_PROMPT = (
     "語氣口語、自然，像在跟朋友聊天，而不是寫條目。"
     "\n\n"
     "【綜合來源 + 引用】"
-    "抓回來的討論開頭會標來源平台（Dcard 口碑庫 / PTT）。請『綜合』實際有抓到的來源一起講，"
+    "抓回來的討論開頭會標來源平台（Dcard / PTT）。請『綜合』實際有抓到的來源一起講，"
     "可以自然帶出差異或出處，例如『Dcard 上比較多人說…，PTT 鄉民則覺得…』。"
     "工具會註明這次哪些平台沒有資料；沒有資料的平台就完全不要提、不要假裝它上面有討論。"
     "當某個具體說法來自抓到的討論時，在句尾自然帶上 [n]，不用每句都標、"
@@ -72,6 +72,19 @@ def _apply_memory(prompt: str, memories: list[str], meta: bool = False) -> str:
             "不要硬湊、也不要直接複述）】\n" + lines)
 
 
+def _apply_thread_context(prompt: str, threads: list[str]) -> str:
+    """把『先前相關對話的脈絡』(thread 記憶) 附到 system prompt 後。
+
+    脈絡含『先前討論過的重點梗概』，可用來回顧、喚回聊過的內容；但加註『要最新狀況仍以本次
+    查到為準』，避免模型把舊梗概當成當下事實、不再即時查證。
+    """
+    if not threads:
+        return prompt
+    lines = "\n".join(f"- {t}" for t in threads)
+    return (prompt + "\n\n【先前相關對話的脈絡（供了解使用者背景、回顧先前討論過的重點；"
+            "若使用者要最新狀況，仍以本次查到的最新討論為準）】\n" + lines)
+
+
 def run(user_message: str, history: list[dict] | None = None, session_id: str = "default",
         end_user_id: int | None = None) -> dict:
     """跑一輪對話。回傳 {answer, used_tools, messages}。
@@ -90,6 +103,9 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
         else:
             system_prompt = _apply_memory(
                 system_prompt, user_memory.recall(end_user_id, user_message))
+            # 脈絡記憶（thread）另一條：命中相關舊對話 → 注入背景區塊（皆 fail-safe）
+            system_prompt = _apply_thread_context(
+                system_prompt, user_memory.recall_threads(end_user_id, user_message))
     max_rounds = cfg.get("max_tool_rounds") or MAX_TOOL_ROUNDS
     model = prefs.get("model") or cfg.get("model")  # None → llm 用 settings.chat_model
     temperature = cfg.get("temperature", 0.2)

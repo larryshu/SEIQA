@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -68,10 +69,15 @@ def _ensure_collection() -> None:
         requests.put(
             url, json={"vectors": {"size": _VECTOR_SIZE, "distance": "Cosine"}}, timeout=15
         ).raise_for_status()
-        # end_user_id 建 payload index（過濾用；失敗不致命，filter 仍可運作只是較慢）
+        # end_user_id / kind 建 payload index（過濾用；失敗不致命，filter 仍可運作只是較慢）
         try:
             requests.put(f"{url}/index",
                          json={"field_name": "end_user_id", "field_schema": "integer"}, timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            requests.put(f"{url}/index",
+                         json={"field_name": "kind", "field_schema": "keyword"}, timeout=10)
         except Exception:  # noqa: BLE001
             pass
     _ensured = True
@@ -103,17 +109,22 @@ def _extract_fact(question: str) -> str:
 
 
 def _store_fact(end_user_id: int, fact: str, question: str = "", answer: str = "",
-                session_id: str = "", kind: str = "turn") -> None:
-    """把一條事實 embed 後 upsert 進 user_memory。呼叫端負責 fail-safe 外層 try。
+                session_id: str = "", kind: str = "turn",
+                embed_text: str = "", headline: str = "") -> None:
+    """把一條記憶 embed 後 upsert 進 user_memory。呼叫端負責 fail-safe 外層 try。
 
-    kind：'turn'＝每輪即時萃取；'session_summary'＝登出時整段對話摘要（備查/分析用）。
+    kind：'turn'＝每輪即時萃取；'session_summary'＝登出時整段對話的原子事實；
+          'thread'＝登出時整場對話的『有脈絡敘事』（headline 檢索、narrative 重載）。
+    embed_text：拿去 embed 的字串；空＝用 fact 本身。thread 傳 headline——用主題句當檢索鍵，
+                避免整段敘事多主題把向量稀釋、召回變糊。
+    headline：thread 的主題句（也存進 payload，供 meta 列表/備查）。
     """
     point = {
         "id": uuid.uuid4().hex,
-        "vector": embed(fact),
+        "vector": embed(embed_text or fact),
         "payload": {
             "end_user_id": int(end_user_id),
-            "text": fact,                        # recall 注入的就是這條事實
+            "text": fact,                        # recall 注入的就是這段（事實或敘事）
             "question": (question or "").strip(),  # 原始問句（備查）
             "answer": (answer or "")[:1000],     # 原始答案（備查，截斷）
             "session_id": session_id,
@@ -121,6 +132,8 @@ def _store_fact(end_user_id: int, fact: str, question: str = "", answer: str = "
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
     }
+    if headline:
+        point["payload"]["headline"] = headline
     requests.put(
         f"{_base()}/collections/{settings.user_memory_collection}/points",
         json={"points": [point]}, timeout=15,
@@ -159,51 +172,91 @@ def _conversation_text(messages: list[dict], max_chars: int = 4000) -> str:
     return "\n".join(lines)[-max_chars:]
 
 
-def _extract_facts_from_conversation(transcript: str) -> list[str]:
-    """從整段對話萃取最多 3 條『關於使用者本人』的長期事實；沒有就回 []。fail-safe。"""
+def _parse_summary(raw: str) -> dict:
+    """解析 LLM 的 {facts, thread}；容錯去 markdown 圍籬、去 NONE；缺欄位回空結構。"""
+    empty = {"facts": [], "thread": {"headline": "", "narrative": ""}}
+    s = (raw or "").strip()
+    if s.startswith("```"):  # 去掉 ```json ... ``` 圍籬
+        s = s.strip("`")
+        s = s[s.find("{"):] if "{" in s else s
+    try:
+        data = json.loads(s)
+    except (ValueError, TypeError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    raw_facts = data.get("facts")
+    facts = ([str(f).strip() for f in raw_facts if str(f).strip()][:3]
+             if isinstance(raw_facts, list) else [])
+    thread = data.get("thread") if isinstance(data.get("thread"), dict) else {}
+    headline = str(thread.get("headline", "") or "").strip()
+    narrative = str(thread.get("narrative", "") or "").strip()
+    if headline.upper() == "NONE":
+        headline = ""
+    if narrative.upper() == "NONE":
+        narrative = ""
+    return {"facts": facts, "thread": {"headline": headline, "narrative": narrative}}
+
+
+def _summarize_conversation(transcript: str) -> dict:
+    """從整段對話一次產出 {facts:[...], thread:{headline, narrative}}。fail-safe，失敗回空結構。
+
+    facts：0–3 條『關於使用者本人』的穩定原子事實（點狀召回用，同舊行為）。
+    thread：一筆有脈絡的敘事——headline 供檢索、narrative 供重載。只記使用者的處境/目標/
+            提問走向與穩定取捨傾向，不記會過時的世界結論（紅線）。
+    """
+    empty = {"facts": [], "thread": {"headline": "", "narrative": ""}}
     if not transcript.strip():
-        return []
+        return empty
     msgs = [
         {"role": "system", "content": (
-            "以下是一段使用者與助理的完整對話。請萃取『關於使用者本人』、可長期記住的事實，"
-            "用於個人化記憶。\n"
-            "規則：\n"
-            "- 只抽關於這個人的穩定事實：身分 / 職業 / 處境 / 長期偏好 / 持續關心的主題領域。\n"
-            "- 不要抽會過時的世界現況、產品排名、時事結論。\n"
-            "- 每條一行，繁體中文、第三人稱、開頭『使用者』，最多 3 條。\n"
-            "- 若整段對話沒有值得長期記住的個人事實，只輸出 NONE。\n"
-            "只輸出事實行（或 NONE），不要編號、不要解釋。"
+            "以下是一段使用者與助理的完整對話。請一次產出兩種長期記憶，嚴格輸出 JSON。\n"
+            "1) facts（維持嚴格）：關於『使用者本人』、可長期記住的穩定事實（身分／職業／處境／"
+            "長期偏好／持續關心的主題），第三人稱、開頭『使用者』，最多 3 條；沒有就給 []。"
+            "facts 絕不要寫世界結論、社群給的答案、會過時的資訊。\n"
+            "2) thread：把這場對話（不論單輪或多輪）濃縮成一段『有脈絡的敘事』，供日後相關問題"
+            "重新載入背景。\n"
+            "   - headline：一句主題化的名詞短語（利於未來相關問題語意命中）。\n"
+            "   - narrative：第三人稱、繁體中文，寫成一段較完整的敘事（約 5–8 句），含兩部分——\n"
+            "     (a) 使用者的處境、目標、關注點、提問走向與顯露的取捨傾向；\n"
+            "     (b) 這場對話『討論到的重點與結論梗概』：給了哪些建議、社群的共識或主要說法是"
+            "什麼，讓日後能喚回討論過的內容。\n"
+            "   但 narrative 要把『會快速過時的具體值』抽象成主題層級：寫『討論了薪資行情與談薪"
+            "策略』而非『年薪 200 萬』；寫『比較了幾款保濕品的口碑』而非『X 牌目前排第一』。"
+            "較常青的通則建議可保留（例：減脂靠熱量赤字＋規律運動、重訓保肌、睡眠充足）。\n"
+            "若整段對話沒有值得長期記住的個人脈絡（純查資料／純常識／純計算），"
+            "facts 給 []、thread 兩欄給空字串。\n"
+            "嚴格輸出 JSON：{\"facts\":[..],\"thread\":{\"headline\":..,\"narrative\":..}}；"
+            "只輸出 JSON，不要 markdown、不要解釋。"
         )},
         {"role": "user", "content": transcript},
     ]
     try:
-        out = chat(msgs, temperature=0.1).strip()
+        out = chat(msgs, temperature=0.1)
     except Exception as e:  # noqa: BLE001
         logger.warning("summarize conversation failed (ignored): %s", e)
-        return []
-    if not out or out.upper().lstrip(" 「『\"").startswith("NONE"):
-        return []
-    facts = []
-    for line in out.splitlines():
-        s = line.strip().lstrip("-•*0123456789.、 ").strip()
-        if s and not s.upper().startswith("NONE"):
-            facts.append(s)
-    return facts[:3]
+        return empty
+    return _parse_summary(out)
 
 
 def summarize_and_remember(end_user_id: int | None, messages: list[dict],
                            session_id: str = "") -> int:
-    """登出時：對整段對話萃取 1–3 條長期事實寫入 user_memory。回傳寫入條數。
+    """登出時：對整段對話一次產出並存兩種記憶，回傳寫入總條數（facts + thread）。
 
-    每輪 remember() 已寫過即時事實；此處補一次整段脈絡摘要（kind='session_summary'）。
-    匿名 / 關閉 / 無事實 → 0；全程 fail-safe，不影響登出流程。
+    - facts（kind='session_summary'）：0–3 條原子事實，補一次整段脈絡的點狀事實。
+    - thread（kind='thread'）：一筆有脈絡敘事，headline 檢索 / narrative 重載（相關問題時載回）。
+    每輪 remember() 已寫過即時事實；此處補整段。匿名 / 關閉 / 無內容 → 0；全程 fail-safe。
     """
     if not settings.user_memory_enabled or not end_user_id or not messages:
         return 0
     try:
-        facts = _extract_facts_from_conversation(_conversation_text(messages))
-        if not facts:
-            return 0
+        summary = _summarize_conversation(_conversation_text(messages))
+        facts = summary.get("facts") or []
+        thread = summary.get("thread") or {}
+        headline = (thread.get("headline") or "").strip()
+        narrative = (thread.get("narrative") or "").strip()
+        if not facts and not (headline and narrative):
+            return 0  # 這段對話沒有值得長期記住的個人脈絡 → 不存，避免雜訊
         _ensure_collection()
         stored = 0
         for fact in facts:
@@ -212,6 +265,13 @@ def summarize_and_remember(end_user_id: int | None, messages: list[dict],
                 stored += 1
             except Exception as e:  # noqa: BLE001 — 單條失敗不影響其他
                 logger.warning("store summary fact failed (ignored): %s", e)
+        if settings.user_thread_enabled and headline and narrative:
+            try:  # thread：embed 主題句、text 存敘事（recall_threads 注入的就是敘事）
+                _store_fact(end_user_id, narrative, session_id=session_id, kind="thread",
+                            embed_text=headline, headline=headline)
+                stored += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("store thread failed (ignored): %s", e)
         return stored
     except Exception as e:  # noqa: BLE001
         logger.warning("summarize_and_remember failed (ignored): %s", e)
@@ -219,7 +279,10 @@ def summarize_and_remember(end_user_id: int | None, messages: list[dict],
 
 
 def recall(end_user_id: int | None, query: str) -> list[str]:
-    """語意撈回這位使用者最相關的記憶（過門檻、依分數高→低）。匿名 / 失敗 → []。"""
+    """語意撈回這位使用者最相關的『原子事實』（kind turn/session_summary，過門檻）。匿名 / 失敗 → []。
+
+    刻意排除 kind='thread'：脈絡敘事走 recall_threads() 另一條（不同門檻、不同注入區塊）。
+    """
     if not settings.user_memory_enabled or not end_user_id or not (query or "").strip():
         return []
     try:
@@ -228,7 +291,10 @@ def recall(end_user_id: int | None, query: str) -> list[str]:
             "vector": embed(query),
             "limit": settings.user_memory_top_k,
             "with_payload": True,
-            "filter": {"must": [{"key": "end_user_id", "match": {"value": int(end_user_id)}}]},
+            "filter": {"must": [
+                {"key": "end_user_id", "match": {"value": int(end_user_id)}},
+                {"key": "kind", "match": {"any": ["turn", "session_summary"]}},
+            ]},
         }
         r = requests.post(
             f"{_base()}/collections/{settings.user_memory_collection}/points/search",
@@ -245,6 +311,45 @@ def recall(end_user_id: int | None, query: str) -> list[str]:
         return out
     except Exception as e:  # noqa: BLE001
         logger.warning("recall failed (ignored): %s", e)
+        return []
+
+
+def recall_threads(end_user_id: int | None, query: str) -> list[str]:
+    """語意撈回這位使用者最相關的『對話脈絡』(kind='thread')。回 narrative 清單（截長度）。
+
+    用主題句 embed 過的 thread 向量比對；門檻比事實高（敘事要夠對題才值得整段注入 context）。
+    匿名 / 關閉 / 失敗 → []。
+    """
+    if (not settings.user_memory_enabled or not settings.user_thread_enabled
+            or not end_user_id or not (query or "").strip()):
+        return []
+    try:
+        _ensure_collection()
+        body = {
+            "vector": embed(query),
+            "limit": settings.user_thread_top_k,
+            "with_payload": True,
+            "filter": {"must": [
+                {"key": "end_user_id", "match": {"value": int(end_user_id)}},
+                {"key": "kind", "match": {"value": "thread"}},
+            ]},
+        }
+        r = requests.post(
+            f"{_base()}/collections/{settings.user_memory_collection}/points/search",
+            json=body, timeout=15,
+        )
+        r.raise_for_status()
+        hits = r.json().get("result", []) or []
+        thr = settings.user_thread_min_score
+        cap = settings.user_thread_max_chars
+        out = []
+        for h in hits:
+            payload = h.get("payload") or {}
+            if float(h.get("score", 0.0)) >= thr and payload.get("text"):
+                out.append(payload["text"][:cap])
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning("recall_threads failed (ignored): %s", e)
         return []
 
 
@@ -268,7 +373,9 @@ def list_memories(end_user_id: int | None, limit: int = 50) -> list[str]:
         points.sort(key=lambda p: (p.get("payload") or {}).get("created_at", ""), reverse=True)
         out = []
         for p in points:
-            t = (p.get("payload") or {}).get("text")
+            payload = p.get("payload") or {}
+            # thread 列主題句（headline）較精簡好讀；其餘 kind 列事實本文（text）
+            t = payload.get("headline") if payload.get("kind") == "thread" else payload.get("text")
             if t:
                 out.append(t)
         return out
