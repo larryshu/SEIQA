@@ -1,0 +1,17 @@
+openai>=1.30
+fastapi>=0.110
+uvicorn>=0.29
+websockets>=12         # /ws/ask：精簡版 uvicorn 不含 WS 協定實作，要另外裝
+python-dotenv>=1.0
+pydantic>=2.6
+streamlit>=1.33
+requests>=2.31
+beautifulsoup4>=4.12   # PTT 即時爬蟲 HTML 解析
+DrissionPage>=4.1      # Dcard 即時爬（DCARD_MODE=live）：驅動真實 Chrome 過 Cloudflare
+playwright
+chromium
+pymysql>=1.1           # M3：runtime 唯讀讀取後台 MySQL 設定
+pyjwt>=2.10            # 終端登入：驗證 Django 簽發的 token
+# 方案 B（hot collection 持久化）要用時才裝：
+# qdrant-client>=1.9
+# redis>=5.0

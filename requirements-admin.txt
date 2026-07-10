@@ -1,0 +1,7 @@
+# 社群輿情智能問答 後台（Django + DRF + MySQL）依賴
+# 安裝到獨立的 .venv-admin，與 runtime 的 .venv 分開
+Django==5.1.15
+djangorestframework==3.17.1
+djangorestframework-simplejwt==5.5.1
+mysqlclient==2.2.8
+python-dotenv==1.2.2

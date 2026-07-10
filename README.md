@@ -6,8 +6,8 @@
 | 項目 | 內容 |
 |---|---|
 | 定位 | tool-calling 的**多平台社群口碑問答 Agent** + 可設定化後台 |
-| 技術棧 | 前台 runtime：FastAPI · PyMySQL · PyJWT · DrissionPage（Dcard 反爬即時爬）· Qdrant · Azure OpenAI；後台：Django 5 · DRF · MySQL 8；前端：Streamlit |
-| 狀態 | M0–M6 + 終端登入 + 使用者長期記憶/登出 + 偏好自動推論 **皆已實作（as-built）**，並通過真實 LLM 端到端驗證 |
+| 技術棧 | 前台 runtime：FastAPI · WebSocket · PyMySQL · PyJWT · DrissionPage（Dcard 反爬即時爬）· Qdrant · Azure OpenAI；後台：Django 5 · DRF · MySQL 8；前端：Streamlit（阻塞問答）＋ WebSocket demo 頁（即時進度 / 逐字串流 / 中途取消） |
+| 狀態 | M0–M6 + 終端登入 + 使用者長期記憶/登出 + 偏好自動推論 + WebSocket 即時前端 **皆已實作（as-built）** |
 
 ---
 
@@ -42,6 +42,7 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 - **Registry + adapter 擴充性**：加平台＝多寫一個 adapter，agent / prompt / loop 全不動；連 Dcard 的「即時爬↔向量庫」切換也靠這層乾淨接起來（`DCARD_MODE`）。
 - **設定資料庫化**：prompt / 模型 / 平台開關 / 檢索門檻全搬進 MySQL，後台改設定**免改程式碼**；runtime 唯讀讀取 + 短 TTL 快取。
 - **全域 fail-safe（分層）**：Dcard 即時爬掛了退向量庫、PTT 掛了只少 PTT、任一來源 embed/Qdrant/後台 DB 出事只降級不中斷；兩邊都空 → 誠實退回常識（🟡 黃燈），反幻覺。
+- **WebSocket 即時前端**：`/ws/ask` 把 agent 的每一步（抽關鍵字、深挖第幾篇、**退回 fallback**）即時推給前端、答案逐字串流，並支援生成中取消。事件匯流排用 `contextvars` 實作，**`/ask` 與 Streamlit 行為完全不變**（見 [§3.3](#33-即時進度串流與取消websocketwsask)）。
 - **三層記憶（長期層雙軌）+ 偏好自動推論**：短期檢索快取、中期對話落地、長期使用者記憶（**事實點狀召回 ＋ 脈絡敘事重載 / episodic 雙軌**）；登出時 LLM 另從對話**自動學習可執行偏好**（白名單 + 保守門檻 + 不覆寫人工設定）。
 - **完整後台**：四模組（agent / 帳戶 / 記憶 / 偏好）、RBAC（admin/editor/viewer）、稽核、JWT 雙身分（操作者 vs 終端使用者）。
 - **SQL 優化實績**：N+1 修正（31→2、21→2 查詢）、複合索引消除 filesort、對話列表分頁對齊索引。
@@ -52,19 +53,24 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 
 | 服務 | 埠 | 角色 |
 |---|---|---|
-| FastAPI runtime（`app/`）| 8001 | 跑 agent、`/ask` 問答、對話落地 MySQL、個人化長期記憶與偏好 |
-| Streamlit 聊天前端（`ui/`）| 8501 | 終端使用者問答、🟢/🟡 燈號、登入 / 登出 |
+| FastAPI runtime（`app/`）| 8001 | 跑 agent、`/ask`（阻塞）與 `/ws/ask`（WebSocket 即時串流）、對話落地 MySQL、個人化長期記憶與偏好；並自行提供 `/demo` 前端 |
+| Streamlit 聊天前端（`ui/`）| 8501 | 終端使用者問答、🟢/🟡 燈號、登入 / 登出（走阻塞 `/ask`）|
 | Django + DRF 後台（`admin_backend/`）| 8000 | 設定 / 帳戶 / 對話管理，**MySQL schema 唯一擁有者** |
 
+> **三個服務、兩個終端前端**：Streamlit（`:8501`，阻塞問答）與 WebSocket demo 頁（`:8001/demo`，即時進度 + 串流 + 取消）。兩者共用同一個 agent，差別只在傳輸方式。
+
 ```
-[Streamlit 聊天 UI]──┐
-                     ├──► [FastAPI runtime]  （跑 agent；唯讀 MySQL + Qdrant）
-[後台 Web 介面]──────┴──► [Django + DRF]      （寫設定/帳戶/對話；擁有 schema/migration）
-                                    │
-                          ┌─────────┴─────────┐
-                     [MySQL]              [Qdrant]
-                  關聯資料：設定、         向量本體：使用者長期記憶
-                  帳戶、對話、metadata     ＋ Dcard fallback 向量庫（唯讀）
+[Streamlit 聊天 UI]────POST /ask────┐
+                                    ├──► [FastAPI runtime]（跑 agent；唯讀 MySQL + Qdrant）
+[WebSocket demo 頁]───WS /ws/ask────┘         │
+   （由 runtime 自己在 /demo 提供）            └─POST /demo/auth/*─┐（伺服器端轉發登入，避開 CORS）
+                                                                   ▼
+[後台 Web 介面]──────────────────────────► [Django + DRF]（寫設定/帳戶/對話；擁有 schema/migration）
+                                                     │
+                                           ┌─────────┴─────────┐
+                                      [MySQL]              [Qdrant]
+                                   關聯資料：設定、         向量本體：使用者長期記憶
+                                   帳戶、對話、metadata     ＋ Dcard fallback 向量庫（唯讀）
 ```
 
 **架構定案要點：**
@@ -73,8 +79,9 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 2. **Schema 唯一擁有者是 Django**：所有表由 Django migration 建立與維護；**FastAPI 用唯讀帳號讀取，絕不建表**。
 3. **MySQL 不存向量**：Dcard 口碑庫的向量本體留在 Qdrant；MySQL 只存 metadata / 統計（`memory_collection`）。
 4. **帳戶涵蓋兩類人**：後台操作者（staff）+ 終端使用者，兩套身分互不混用。
-5. **一鍵起全部**：`.\start.ps1` 同時起 8000/8001/8501（關掉前端會一併收掉另外兩個）。
+5. **一鍵起全部**：`.\start.ps1` 同時起 8000/8001/8501，就緒後（輪詢 `/health`）自動開啟 `http://localhost:8001/demo`；Streamlit 以 `--server.headless` 啟動、不再自己彈瀏覽器，但 8501 仍可手動開。關掉前景視窗會一併收掉另外兩個。
 6. **後台掛掉不影響問答**：runtime 讀不到 DB 時自動 fallback 到 `.env`／寫死預設值照常跑。
+7. **兩個前端共用同一個 agent**：`/ask` 與 `/ws/ask` 都走 `app/agent.py`，共用 `_build_context()`（prompt / 偏好 / 記憶組裝）；差別只在前者阻塞回完整答案、後者邊跑邊推事件。
 
 ---
 
@@ -103,6 +110,19 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 - **fail-safe（分層）**：Dcard 即時爬失敗自動退向量庫；PTT 失敗只少 PTT；任一平台 embed/Qdrant 出事只影響那一邊；兩邊都空就退回常識回答。
 - **工具＝skill**：`tools.py` 的 `description` 寫清楚「何時該用」＝觸發條件，等同 Hermes skill 的 trigger。
 
+### 3.3 即時進度、串流與取消（WebSocket，`/ws/ask`）
+
+`/ask` 是阻塞請求：Dcard 時間預算 100s、PTT 60s（並行），最壞情況使用者盯著 spinner 等近兩分鐘、毫無回饋。`/ws/ask` 就是為了解決這件事，而 `/ask` 原封不動保留。
+
+- **事件匯流排 `app/progress.py`**：用 `contextvars` 傳遞 emitter 與取消號誌，而不是改函式簽章——所以 `Source.fetch()` 介面不變，README 承諾的「加平台＝只寫一個 adapter」依然成立。**沒有訂閱者時 `emit()` 是 no-op**，`/ask` 行為一個位元都沒變。fan-out 的每個 future 各複製一份 `Context`（同一個 `Context` 不能被兩條執行緒同時 `run`）。
+- **事件流**：`stage` → `crawl_plan` → `crawl_search` → `crawl_progress`（就地更新）→ `source_fallback` / `source_error` → `source_done` → `search_done` → `token`（逐字）→ `done` / `cancelled` / `error`。其中 **`source_fallback` 讓原本只寫進後端 log 的分層降級，變成使用者看得見的產品行為**。
+- **逐字串流**：`llm.chat_with_tools_stream()`。串流時 `tool_calls` 的 `arguments` 是一片一片吐出的（`name`/`id` 只在首片），依 `delta.index` 分槽累積才拼得回來。
+- **取消**：`progress.Cancelled` 刻意繼承 **`BaseException` 而非 `Exception`**。底層到處是 fail-safe 的 `except Exception`，其中 `dcard_live.crawl()` 會把攔到的例外解讀成「即時爬失敗 → 退回向量庫」；若取消是普通 `Exception`，使用者按停止會誤觸一次沒必要的 fallback。（標準庫的 `asyncio.CancelledError` 基於同一理由這樣設計。）fan-out 用 `fut.result(timeout=0.5)` 輪詢而非死等，前端 0.5 秒內收到 `cancelled`。
+  > **已知限制**：DrissionPage 是阻塞的、無法從外部中斷，取消只是「不再等它」——那顆 Chrome 會握著單例鎖跑到時間預算結束。所以取消後立刻再問一題，Dcard 那條會排隊（PTT 不受影響）。
+- **認證是 per-connection 的**：瀏覽器的 WebSocket API 不能帶自訂 header，所以 token 走 query string（`/ws/ask?token=<jwt>`），而且**握手時只讀一次**——登入 / 登出後必須斷線重連。這與 HTTP 每個 request 都能換 header 不同。
+- **登入代理 `/demo/auth/{login,register}`**：demo 頁由 runtime（:8001）提供、Django 在 :8000，瀏覽器直接打是跨來源請求，而後台沒裝 `django-cors-headers`。改由 runtime 在伺服器端轉發，瀏覽器全程同源。Streamlit 不會遇到這問題，因為它的 `requests.post` 本來就跑在伺服器端。
+- **併發模型**：整條連線只有**一個 reader 協程**呼叫 `receive()`（Starlette 不允許並行 receive），`cancel` 就地處理、其餘訊息排進佇列；agent 跑在 `asyncio.to_thread` 的 worker thread，事件經 `loop.call_soon_threadsafe` 回到事件迴圈。
+
 ---
 
 ## 4. 記憶（三層）與偏好
@@ -125,6 +145,8 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 - **只有登入使用者**才有長期記憶與對話歸戶；匿名照常能問答但不留記憶。全程 fail-safe：記憶那層炸掉也不影響回答。
 
 **登入 / 登出流程（as-built）**：Streamlit 向 Django `end-auth` 拿 JWT（共用 `TOKEN_SECRET`、HS256），聊天帶 `Authorization: Bearer`；runtime 驗證取 `end_user_id`（失敗即匿名）。**登出**（`POST /logout`）把整段對話 ①摘要成長期事實**＋一筆脈絡敘事（thread）**寫入 `user_memory`、②推論可執行偏好寫入 `user_preference`、③軟刪原始對話，回 `{ok, summarized, inferred, deleted_rows}`（`summarized` 含事實與 thread 條數）。
+
+> **WebSocket demo 頁的登入路徑不同**：瀏覽器不能跨來源打 Django，改打 runtime 的 `POST /demo/auth/{login,register}` 由伺服器端轉發（見 [§3.3](#33-即時進度串流與取消websocketwsask)）；拿到 token 後**重新握手** WebSocket。登出仍是同源的 `POST /logout`，走完全相同的摘要 / 偏好推論 / 軟刪流程。
 
 > 詳細機制（每輪萃取、meta 問題列表、payload 備查、四道護欄）見 [`admin_backend_spec.md` §8.1–8.3](docs/admin_backend_spec.md#81-終端登入與-token-驗證as-built)。
 
@@ -314,12 +336,14 @@ SEIQA/
 │   user_memory.py          # 使用者長期語意記憶（Qdrant：萃取事實 → 注入 prompt）
 │   user_preference.py      # 使用者偏好自動推論（登出時萃取設定旋鈕 → MySQL user_preference）
 │   auth.py                 # 驗證 Django 簽發的終端 token → end_user_id（失敗即匿名）
-│   api.py                  # FastAPI：/ask、/logout、/health、/internal/reload-config
-├─ ui/streamlit_app.py      # 聊天前端（🟢/🟡 燈號 + 來源分組 + 登入/登出）
+│   progress.py             # 即時事件匯流排 + 取消號誌（contextvars；無訂閱者時 no-op）
+│   api.py                  # FastAPI：/ask、/ws/ask、/logout、/demo、/demo/auth/*、/health、/internal/reload-config
+│   static/ws_demo.html     # WebSocket 前端：agent 即時進度 + 逐字串流 + 停止鈕 + 登入/登出
+├─ ui/streamlit_app.py      # Streamlit 聊天前端（🟢/🟡 燈號 + 來源分組 + 登入/登出；走阻塞 /ask）
 ├─ admin_backend/           # Django + DRF 後台（accounts / agents / memory / preferences）
 ├─ docs/admin_backend_spec.md   # 後台完整規格（本檔的來源之一）
 ├─ .venv/ /.venv-admin/     # runtime 環境 / Django 後台環境
-└─ start.ps1                # 一鍵起 Django(8000) + FastAPI(8001) + Streamlit(8501)
+└─ start.ps1                # 一鍵起 Django(8000) + FastAPI(8001) + Streamlit(8501)，並自動開 /demo
 ```
 
 ---
@@ -348,10 +372,17 @@ uvicorn app.api:app --reload --port 8001
 python -m venv .venv-admin
 .venv-admin\Scripts\pip install -r requirements-admin.txt
 .venv-admin\Scripts\python admin_backend\manage.py migrate
-.\start.ps1                                                  # Django 8000 + FastAPI 8001 + Streamlit 8501
+.\start.ps1                        # Django 8000 + FastAPI 8001 + Streamlit 8501，並自動開 /demo
 ```
 
-**測試**：Swagger UI（http://localhost:8001/docs）／ curl `POST /ask` ／ Streamlit 前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則」或「🟡 LLM 既有常識」。兩來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET)` 秒（非相加）。
+**兩個前端**：
+
+| 前端 | 網址 | 特性 |
+|---|---|---|
+| WebSocket demo（`start.ps1` 自動開） | http://localhost:8001/demo | agent 即時進度、逐字串流、**中途可停止**、來源依平台分組收合 |
+| Streamlit | http://localhost:8501 | 阻塞問答（送出後等完整答案），需手動開啟 |
+
+**測試**：Swagger UI（http://localhost:8001/docs，注意 WebSocket 不會出現在 OpenAPI）／ curl `POST /ask` ／ 兩個前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則」或「🟡 LLM 既有常識」。兩來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET)` 秒（非相加）——這也正是 `/demo` 要即時推進度的原因。
 
 ---
 
@@ -395,6 +426,7 @@ DB_USER=crawl_ro   / DB_PASSWORD=...      # 唯讀帳號（讀設定 / 偏好）
 DB_RW_USER=crawl_rw / DB_RW_PASSWORD=...  # 讀寫帳號（寫 conversation / message / user_preference）
 CONFIG_CACHE_TTL=30                  # runtime 設定快取秒數
 TOKEN_SECRET=...                     # 與 admin_backend/.env 同值：驗證終端登入 token
+ADMIN_API_URL=http://localhost:8000  # /demo 頁的登入/註冊由 runtime 伺服器端轉發到這裡（避開 CORS）
 ```
 
 ---
@@ -418,8 +450,13 @@ agent / tools / prompt 都不用動——這就是 registry 的用意。
 | M4–M5 | 模組三對話落地 + 檢視 API；模組四 system_setting + user_preference + 取值優先序 |
 | M6 | 後台前端（先用 Django Admin / DRF browsable API） |
 | 追加 | 終端登入（Django 發 token / runtime 驗）、使用者長期記憶、登出摘要、**偏好自動推論** |
+| 追加 | **WebSocket 即時前端**：`progress.py` 事件匯流排、`/ws/ask` 逐字串流、中途取消、`/demo` 頁與登入代理 |
 
-> ✅ **as-built**：全部完成並通過真實 LLM 端到端驗證（後台改 prompt→reload→回答變、`community_search` 雙來源、對話落地、登入後偏好過濾平台 + 對話歸戶、登出摘要與偏好推論）。
+> ✅ **as-built**：M0–M6 與個人化記憶／偏好推論皆通過真實 LLM 端到端驗證（後台改 prompt→reload→回答變、`community_search` 雙來源、對話落地、登入後偏好過濾平台 + 對話歸戶、登出摘要與偏好推論）。
+>
+> ✅ **WebSocket 路徑**：事件流、逐字串流、取消（0.16s 內收到 `cancelled`）、同連線多輪、登入代理與 `/ask` 不回歸，皆以自動化測試對真實 uvicorn 驗證過（agent 以 stub 替換）。
+>
+> ✅ **`chat_with_tools_stream()` 已對真實 Azure OpenAI 驗證**（`stream=True` + tools）：常識題正確不呼叫工具並逐字串流；需查題在串流中組出 `community_search` 的 tool_call，分片累積出的 `arguments` 為合法 JSON。長答案實測 305 片 token 於 1.67s 內陸續到達（確為串流、非一次回傳）。備註：此端點首片延遲約 7s（模型/gateway 起始等待，非程式問題）——正好凸顯進度推播的價值。
 
 ---
 

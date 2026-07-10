@@ -1,11 +1,14 @@
-"""薄薄一層 LLM 客戶端：chat()（純文字）+ chat_with_tools()（function calling）。
+"""薄薄一層 LLM 客戶端：chat()（純文字）+ chat_with_tools()（function calling）
++ chat_with_tools_stream()（同上但逐字串流，給 /ws/ask 用）。
 靠 .env 在 OpenAI / 相容端點（vLLM）與 Azure OpenAI 之間切換——與 dcard_insight 同概念。
 """
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from functools import lru_cache
 
+from . import progress
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -87,3 +90,69 @@ def chat_with_tools(messages: list[dict], tools: list[dict], temperature: float 
         tool_choice="auto",
     )
     return resp.choices[0].message
+
+
+def _merge_tool_call_deltas(acc: dict[int, dict], deltas) -> None:
+    """把串流回來的 tool_calls 分片依 index 合併成完整的 tool call。
+
+    串流時 function.arguments 是一段一段（有時一個字元）吐出來的，name/id 只在第一片出現，
+    所以要以 delta.index 當槽位累積字串，不能直接覆寫。
+    """
+    for d in deltas:
+        slot = acc.setdefault(d.index, {"id": "", "type": "function",
+                                        "function": {"name": "", "arguments": ""}})
+        if d.id:
+            slot["id"] = d.id
+        if d.function is None:
+            continue
+        if d.function.name:
+            slot["function"]["name"] = d.function.name
+        if d.function.arguments:
+            slot["function"]["arguments"] += d.function.arguments
+
+
+def chat_with_tools_stream(messages: list[dict], tools: list[dict], temperature: float = 0.2,
+                           model: str | None = None) -> Iterator[tuple[str, object]]:
+    """chat_with_tools 的串流版。逐一 yield ('token', 文字片段)，最後 yield ('message', dict)。
+
+    最後那個 message dict 的形狀與非串流版的 message.model_dump(exclude_none=True) 對齊
+    （content 為空時不放，才能安全塞回 messages 陣列），供 agent loop 繼續跑工具。
+
+    每收一片就檢查取消 → 使用者在「生成中」按停止能立刻中斷；退出時關掉 stream，
+    底層 HTTP 連線隨之中止，不會讓 LLM 繼續算完整段。
+    """
+    stream = _client().chat.completions.create(
+        model=model or settings.chat_model,
+        temperature=temperature,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        stream=True,
+    )
+    content_parts: list[str] = []
+    tool_acc: dict[int, dict] = {}
+    try:
+        for chunk in stream:
+            progress.raise_if_cancelled()
+            if not chunk.choices:  # Azure 首片常是空 choices（內容過濾 metadata）
+                continue
+            delta = chunk.choices[0].delta
+            if delta is None:
+                continue
+            if delta.content:
+                content_parts.append(delta.content)
+                yield ("token", delta.content)
+            if delta.tool_calls:
+                _merge_tool_call_deltas(tool_acc, delta.tool_calls)
+    finally:
+        stream.close()
+
+    msg: dict = {"role": "assistant"}
+    content = "".join(content_parts)
+    if content:
+        msg["content"] = content
+    if tool_acc:
+        msg["tool_calls"] = [tool_acc[i] for i in sorted(tool_acc)]
+    if "content" not in msg and "tool_calls" not in msg:
+        msg["content"] = ""  # 模型什麼都沒回：給個空字串，上層照常收斂
+    yield ("message", msg)

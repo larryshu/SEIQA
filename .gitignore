@@ -13,11 +13,18 @@ __pycache__/
 # 執行期資料（跑起來才產生，不需入庫）
 qdrant_data/
 ui/.sessions/
+
+# 個人用文件 / 簡報素材，不隨程式碼發布
 ROADMAP.md
 *講稿.md
 *ppt.py
 *.txt
 *.pptx
+
+# 但依賴清單必須入庫，否則 clone 下來裝不了東西（上面的 *.txt 會把它一起吃掉）
+!requirements.txt
+!requirements-admin.txt
+
 # 本機開發工具設定
 .claude/
 admin_backend/preferences/migrations/

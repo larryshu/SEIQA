@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 from urllib.parse import quote
 
-from . import llm
+from . import llm, progress
 from .config import settings
 from .crawler import Post
 
@@ -390,13 +390,17 @@ def _to_post(meta: dict[str, Any], full: dict[str, Any] | None,
 
 
 def _run(keywords: list[str], deep_max: int, deadline: float) -> list[Post]:
-    """實際爬：全站搜尋（多關鍵詞合併去重）→ 時間預算內逐篇深挖內文+留言。"""
+    """實際爬：全站搜尋（多關鍵詞合併去重）→ 時間預算內逐篇深挖內文+留言。
+
+    搜尋與逐篇深挖的迴圈頂端都設了取消檢查點：使用者按停止時，最多再等一篇貼文的時間。
+    """
     crawler = _get_crawler()
 
     # 1) 全站搜尋，多關鍵詞合併、以 post id 去重、保序（≈相關度）
     metas: list[dict[str, Any]] = []
     seen: set[str] = set()
     for kw in keywords:
+        progress.raise_if_cancelled()
         if time.monotonic() >= deadline or len(metas) >= deep_max:
             break
         for m in crawler.search_global(kw, max_posts=deep_max):
@@ -405,12 +409,16 @@ def _run(keywords: list[str], deep_max: int, deadline: float) -> list[Post]:
                 continue
             seen.add(key)
             metas.append(m)
+    progress.emit("crawl_search", platform="dcard", found=len(metas))
 
     # 2) 逐篇深挖（時間預算內；到時間就回目前已抓到的）
     posts: list[Post] = []
-    for i, m in enumerate(metas[:deep_max]):
+    planned = metas[:deep_max]
+    for i, m in enumerate(planned):
+        progress.raise_if_cancelled()
         if time.monotonic() >= deadline:
             log.info("Dcard 到時間預算，已深挖 %d 篇就停", len(posts))
+            progress.emit("crawl_budget", platform="dcard", done=len(posts))
             break
         if i:  # 每篇之間停頓，降低『操作頻率過快』觸發 Cloudflare 互動盾
             crawler.page.wait(random.uniform(settings.dcard_post_delay_min, settings.dcard_post_delay_max))
@@ -418,6 +426,8 @@ def _run(keywords: list[str], deep_max: int, deadline: float) -> list[Post]:
         post = _to_post(m, full, comments)
         if post:
             posts.append(post)
+        progress.emit("crawl_progress", platform="dcard",
+                      done=len(posts), total=len(planned))
     log.info("Dcard 即時爬完成：搜到 %d 篇、深挖回 %d 篇", len(metas), len(posts))
     return posts
 
@@ -432,11 +442,14 @@ def crawl(query: str, max_posts: int | None = None, time_budget: int | None = No
     budget = time_budget or settings.dcard_time_budget
     deadline = time.monotonic() + budget
     keywords = _extract_keywords(query)
+    progress.emit("crawl_plan", platform="dcard", keywords=keywords)
     log.info("Dcard 即時爬：keywords=%r deep_max=%d budget=%ds", keywords, deep_max, budget)
     with _lock:
         try:
             return _run(keywords, deep_max, deadline)
         except Exception as e:  # noqa: BLE001 — live 爬蟲什麼都可能炸，一律 fail-safe
+            # 取消（progress.Cancelled）是 BaseException，刻意不被這裡攔下：
+            # 使用者按停止不該被當成「爬蟲掛了」而觸發一次沒必要的向量庫 fallback。
             log.warning("Dcard 即時爬失敗（將 fallback 向量庫）：%s", e)
             _reset_crawler()
             return []

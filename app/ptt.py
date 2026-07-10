@@ -22,7 +22,7 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
-from . import llm
+from . import llm, progress
 from .config import settings
 from .crawler import Post
 
@@ -189,6 +189,7 @@ def search(query: str, board: str | None = None, time_budget: int | None = None)
     deadline = time.monotonic() + budget
     planned_board, keywords = _plan_search(query)
     chosen = board or planned_board  # 整句問句搜不到，一律用抽出的單一關鍵詞去搜
+    progress.emit("crawl_plan", platform="ptt", board=chosen, keywords=keywords)
     log.info("PTT 搜尋 board=%s keywords=%r budget=%ds", chosen, keywords, budget)
 
     sess = _session()
@@ -197,15 +198,18 @@ def search(query: str, board: str | None = None, time_budget: int | None = None)
     seen: set[str] = set()  # 跨關鍵詞以文章 url 去重
     try:
         for kw in keywords:  # 每個單詞各搜一次、合併（解決多詞 AND → 0 結果）
+            progress.raise_if_cancelled()
             if time.monotonic() >= deadline:
                 break
             page = 1
             while time.monotonic() < deadline:
+                progress.raise_if_cancelled()
                 th.wait()
                 links = _search_page_links(sess, chosen, kw, page)
                 if links is None or not links:  # 請求失敗或該詞沒有更多結果
                     break
                 for href in links:
+                    progress.raise_if_cancelled()  # 逐篇檢查點：停止最多再等一篇
                     if time.monotonic() >= deadline:
                         break
                     if href in seen:
@@ -220,7 +224,10 @@ def search(query: str, board: str | None = None, time_budget: int | None = None)
                         continue
                     posts.append(Post(title=title, url=_BASE + href, content=body,
                                       created_at=created, source="ptt"))
+                    progress.emit("crawl_progress", platform="ptt", done=len(posts))
                 page += 1
+        if time.monotonic() >= deadline:
+            progress.emit("crawl_budget", platform="ptt", done=len(posts))
         log.info("PTT 抓到 %d 篇（board=%s, keywords=%r）", len(posts), chosen, keywords)
     finally:
         sess.close()

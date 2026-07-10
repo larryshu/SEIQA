@@ -115,6 +115,8 @@ class Settings:
     db_rw_password: str = os.environ.get("DB_RW_PASSWORD", "")
     # 終端使用者登入 token 簽章密鑰（與 Django 共用，驗證 /ask 帶的 token）
     token_secret: str = os.environ.get("TOKEN_SECRET", "").strip()
+    # Django 後台位址：/demo 頁的登入/註冊由 runtime 伺服器端轉發過去（見 api.py demo_auth）
+    admin_api_url: str = os.environ.get("ADMIN_API_URL", "http://localhost:8000").strip()
 
 
 settings = Settings()
