@@ -82,6 +82,9 @@
            border:none; font-weight:600; }
   button:disabled { opacity:.4; cursor:not-allowed; }
   #stop { background:var(--red); }
+  #newChat { padding:5px 12px; font-size:12.5px; font-weight:500; background:var(--bg);
+             color:var(--muted); border:1px solid var(--line); }
+  #newChat:hover:not(:disabled) { background:var(--panel); color:var(--text); }
 
   /* 登入 / 註冊彈窗 */
   #modal { display:none; position:fixed; inset:0; background:rgba(15,20,30,.45);
@@ -106,6 +109,7 @@
 <header>
   <h1>SEIQA · 社群輿情問答</h1>
   <span id="status">未連線</span>
+  <button id="newChat">＋ 新對話</button>
 </header>
 
 <main>
@@ -152,12 +156,38 @@
 const $ = id => document.getElementById(id);
 const newSid = () => "ws-" + Math.random().toString(36).slice(2, 10);
 
-let sessionId = newSid();
-let history = [];          // [{role, content}] —— 與 /ask、/logout 相同的格式
+// sid 放網址（比照 Streamlit）：F5 後 sid 不變，才有得還原。
+let sessionId = new URLSearchParams(location.search).get("sid") || newSid();
+// 送給後端的對話上下文：**只能有 role/content**——它會被原樣攤進 LLM 的 messages 陣列，
+// 多塞 sources 之類的欄位會被 OpenAI API 拒收。
+let chatHistory = [];
+// 畫面用的同一段對話（多帶 sources，重整後才重畫得出來源清單）。兩者一起長、一起清。
+let turns = [];            // [{q, a, sources}]
 let ws = null, busy = false, mode = "login";
 let token = null, userName = null;
 let turn = null;           // 當前這一輪的 DOM 節點集合
 const progressLines = {};  // platform -> 就地更新的那一行，避免逐篇洗版
+
+/* ---------- 本機持久化（方法 A）----------
+   localStorage 存 token 與各 sid 的對話。註：token 放 localStorage 會被 XSS 讀走，
+   demo 可接受；正式環境應改用 httpOnly cookie。 */
+const LS_TOKEN = "seiqa.token", LS_USER = "seiqa.user";
+const histKey = sid => `seiqa.hist.${sid}`;
+
+function lsGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch { /* 無痕模式/配額滿：不持久化就是了 */ } }
+function lsDel(k) { try { localStorage.removeItem(k); } catch { /* 同上 */ } }
+
+function saveLocal() { lsSet(histKey(sessionId), JSON.stringify(turns)); }
+
+function loadLocal() {
+  try { return JSON.parse(lsGet(histKey(sessionId)) || "[]"); } catch { return []; }
+}
+
+function setSid(sid) {
+  sessionId = sid;
+  window.history.replaceState(null, "", `?sid=${encodeURIComponent(sid)}`);  // 不留下一堆上一頁
+}
 
 /* ---------- 進度欄 ---------- */
 function log(text, cls) {
@@ -243,6 +273,58 @@ function renderSources(box, list) {
   box.style.display = "block";
 }
 
+function setLight(node, hasSources) {
+  node.innerHTML = hasSources
+    ? '<span style="color:var(--green)">🟢 綜合社群討論作答</span>'
+    : '<span style="color:var(--yellow)">🟡 未查到社群討論，以 LLM 既有常識作答</span>';
+}
+
+/* ---------- 還原（方法 B：後端讀 MySQL；失敗才退回本機備份）---------- */
+function renderRestored(list) {
+  for (const t of list) {
+    const node = newTurn(t.q);
+    node.answer.classList.remove("streaming");   // 還原的不是正在生成的
+    node.answer.textContent = t.a;
+    setLight(node.light, (t.sources || []).length > 0);
+    renderSources(node.sources, t.sources || []);
+  }
+}
+
+/** 後端回的是逐則訊息（[{role, content, sources}]），畫面要的是逐輪（q/a）→ 配對成對。 */
+function toTurns(messages) {
+  const out = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role !== "user") continue;
+    const next = messages[i + 1];
+    if (!next || next.role !== "assistant") continue;  // 落單的 user（例如被取消那輪）就跳過
+    out.push({ q: messages[i].content, a: next.content, sources: next.sources || [] });
+  }
+  return out;
+}
+
+async function restore() {
+  let restored = [];
+  if (token) {
+    try {
+      const r = await fetch(`/conversation/${encodeURIComponent(sessionId)}`,
+                            { headers: { Authorization: `Bearer ${token}` } });
+      if (r.ok) restored = toTurns((await r.json()).history || []);
+    } catch (e) {
+      console.warn("後端還原失敗，改用本機備份", e);
+    }
+  }
+  // 匿名（後端沒有可綁定的對話）、或 DB 沒開／落地失敗 → 退回本機那份
+  if (!restored.length) restored = loadLocal();
+  if (!restored.length) return;
+
+  turns = restored;
+  chatHistory = restored.flatMap(t => [{ role: "user", content: t.q },
+                                       { role: "assistant", content: t.a }]);
+  renderRestored(turns);
+  saveLocal();   // 後端版本回填本機，兩邊對齊
+  log(`已載入這段對話的 ${turns.length} 輪紀錄`, "dim");
+}
+
 /* ---------- WebSocket ---------- */
 function connect() {
   return new Promise(resolve => {
@@ -313,12 +395,12 @@ function handle(ev) {
       break;
 
     case "done":
-      turn.light.innerHTML = ev.light === "green"
-        ? '<span style="color:var(--green)">🟢 綜合社群討論作答</span>'
-        : '<span style="color:var(--yellow)">🟡 未查到社群討論，以 LLM 既有常識作答</span>';
+      setLight(turn.light, ev.light === "green");
       renderSources(turn.sources, ev.sources);
-      history.push({ role: "user", content: turn.question });
-      history.push({ role: "assistant", content: ev.answer });
+      chatHistory.push({ role: "user", content: turn.question });
+      chatHistory.push({ role: "assistant", content: ev.answer });
+      turns.push({ q: turn.question, a: ev.answer, sources: ev.sources || [] });
+      saveLocal();   // 後端這輪也已 persist_turn()；本機這份是匿名/DB 沒開時的備援
       setBusy(false);
       break;
 
@@ -349,14 +431,16 @@ async function ask() {
   turn = newTurn(question);
   turn.question = question;
   setBusy(true);
-  ws.send(JSON.stringify({ type: "ask", message: question, session_id: sessionId, history }));
+  ws.send(JSON.stringify({ type: "ask", message: question,
+                           session_id: sessionId, history: chatHistory }));
   $("q").value = "";
 }
 
 /* ---------- 登入 / 註冊 / 登出 ---------- */
 function resetConversation() {
-  sessionId = newSid();     // 換 sid：登入後開一段乾淨對話，不把匿名訊息算進使用者名下
-  history = [];
+  setSid(newSid());         // 換 sid（同時更新網址）：登入後開一段乾淨對話，不把匿名訊息算進使用者名下
+  chatHistory = [];
+  turns = [];
   $("chat").innerHTML = "";
   $("log").innerHTML = "";
   turn = null;
@@ -393,6 +477,8 @@ async function submitAuth() {
 
     token = data.token;
     userName = data.display_name || data.username;
+    lsSet(LS_TOKEN, token);
+    lsSet(LS_USER, userName);
     $("modal").classList.remove("open");
     $("mu").value = $("mp").value = $("md").value = "";
     resetConversation();
@@ -416,12 +502,16 @@ async function logout() {
     await fetch("/logout", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-      body: JSON.stringify({ session_id: sessionId, history }),
+      body: JSON.stringify({ session_id: sessionId, history: chatHistory }),
     });
   } catch (e) {
     console.warn("登出請求失敗（仍會清掉本地身分）", e);
   }
   setBusy(false);
+  // 後端已把這段對話軟刪（is_deleted=1），本機那份備份也要一起清掉——
+  // 否則下一位在同一台瀏覽器開同一個 sid，還會從 localStorage 讀回這段對話。
+  lsDel(histKey(sessionId));
+  lsDel(LS_TOKEN); lsDel(LS_USER);
   token = null; userName = null;
   resetConversation();
   renderAcct();
@@ -446,8 +536,38 @@ $("cancelBtn").onclick = () => $("modal").classList.remove("open");
 $("submitBtn").onclick = submitAuth;
 $("mp").onkeydown = e => { if (e.key === "Enter") submitAuth(); };
 $("modal").onclick = e => { if (e.target.id === "modal") $("modal").classList.remove("open"); };
+$("newChat").onclick = () => {
+  if (busy) return;                 // 生成中換 sid 會讓這一輪落地到孤兒對話
+  resetConversation();              // sid 留在網址、舊對話仍在 DB（可用舊網址回去）
+  log("已開一段新對話", "dim");
+};
 
-connect();
+/* ---------- 啟動 ---------- */
+async function boot() {
+  setSid(sessionId);                            // 新開的頁面：把 sid 補進網址，F5 才回得來
+  token = lsGet(LS_TOKEN);
+  userName = lsGet(LS_USER);
+  if (token) {
+    // token 有 7 天效期。過期還頂著使用者名稱最糟：畫面顯示已登入，記憶／偏好卻全部靜默失效
+    // （runtime 驗不過就當匿名）。開場問一次 /me，過期就誠實退回匿名。
+    try {
+      const r = await fetch("/me", { headers: { Authorization: `Bearer ${token}` } });
+      const ok = r.ok && (await r.json()).authenticated;
+      if (!ok) {
+        lsDel(LS_TOKEN); lsDel(LS_USER);
+        token = null; userName = null;
+        log("登入已過期，已回到匿名（重新登入即可繼續累積長期記憶）", "warn");
+      }
+    } catch (e) {
+      console.warn("驗證 token 失敗，先當作匿名", e);
+    }
+  }
+  renderAcct();
+  await connect();
+  await restore();                              // 有 token → 讀 MySQL；否則退回本機備份
+}
+
+boot();
 </script>
 </body>
 </html>

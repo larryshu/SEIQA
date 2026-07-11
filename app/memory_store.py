@@ -83,6 +83,87 @@ def persist_turn(session_id: str, user_message: str, answer: str,
                 pass
 
 
+def load_history(session_id: str, end_user_id: int | None, limit: int = 200) -> list[dict]:
+    """讀回這位使用者這段對話的訊息（供前端重整後還原上下文）。
+
+    只鎖 sid + end_user_id + is_deleted=0：知道別人的 sid 也讀不到別人的對話，
+    登出時軟刪掉的對話也不會被還原。用 crawl_rw 現有的 SELECT 權限即可。
+    回 [{role, content, sources}]（依時間排序），任何失敗都回 [] —— 還原是加值功能，不該擋住聊天。
+    """
+    if not _enabled() or not session_id or not end_user_id:
+        return []
+    conn = None
+    try:
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT m.role, m.content, m.sources FROM message m "
+                "JOIN conversation c ON m.conversation_id = c.id "
+                "WHERE c.sid=%s AND c.end_user_id=%s AND c.is_deleted=0 "
+                "ORDER BY m.created_at, m.id LIMIT %s",
+                (session_id, int(end_user_id), int(limit)),
+            )
+            rows = cur.fetchall()
+        return [
+            {"role": role, "content": content or "", "sources": _loads(sources)}
+            for role, content, sources in rows
+            if role in ("user", "assistant")
+        ]
+    except Exception as e:  # noqa: BLE001 — 讀不回來就當沒有歷史，前端照樣能開新對話
+        logger.warning("load history failed (ignored): %s", e)
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def list_conversations(end_user_id: int | None, limit: int = 30) -> list[dict]:
+    """列出這位使用者未刪除的對話（新→舊），供前端做「我的對話」清單、跨裝置接續。"""
+    if not _enabled() or not end_user_id:
+        return []
+    conn = None
+    try:
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT sid, title, message_count, last_active_at FROM conversation "
+                "WHERE end_user_id=%s AND is_deleted=0 "
+                "ORDER BY last_active_at DESC, id DESC LIMIT %s",
+                (int(end_user_id), int(limit)),
+            )
+            rows = cur.fetchall()
+        return [
+            {"sid": sid, "title": title or "", "message_count": count or 0,
+             "last_active_at": last_active.isoformat() if last_active else ""}
+            for sid, title, count, last_active in rows
+        ]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("list conversations failed (ignored): %s", e)
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _loads(raw) -> list:
+    """message.sources 是 JSON 欄；driver 可能回字串或已解析好的 list。壞資料一律當空。"""
+    if isinstance(raw, list):
+        return raw
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def soft_delete_conversation(session_id: str, end_user_id: int | None) -> int:
     """登出時軟刪『這位使用者這段對話』（UPDATE is_deleted=1）。回傳受影響列數。
 

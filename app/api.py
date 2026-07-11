@@ -62,6 +62,24 @@ class LogoutResp(BaseModel):
     deleted_rows: int = 0   # 軟刪的 conversation 列數
 
 
+class HistoryMsg(BaseModel):
+    role: str               # 'user' | 'assistant'
+    content: str
+    sources: list[Source] = []  # 只有 assistant 有；還原時前端要重畫來源清單
+
+
+class HistoryResp(BaseModel):
+    sid: str
+    history: list[HistoryMsg] = []
+
+
+class ConversationBrief(BaseModel):
+    sid: str
+    title: str = ""
+    message_count: int = 0
+    last_active_at: str = ""
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
@@ -112,6 +130,46 @@ def logout(req: LogoutReq, authorization: str | None = Header(default=None)) -> 
     # 3) 軟刪這位使用者這段對話的原始紀錄（只鎖 sid + end_user_id）
     deleted_rows = memory_store.soft_delete_conversation(req.session_id, end_user_id)
     return LogoutResp(ok=True, summarized=summarized, inferred=inferred, deleted_rows=deleted_rows)
+
+
+@app.get("/me")
+def me(authorization: str | None = Header(default=None)) -> dict:
+    """這個 token 現在還算數嗎？前端重整後拿存下來的 token 問一次——JWT 有 7 天效期，
+    過期了就該把 UI 退回匿名，而不是顯示著使用者名稱、記憶功能卻全部靜默失效。"""
+    end_user_id = end_user_id_from_token(authorization)
+    return {"authenticated": end_user_id is not None, "end_user_id": end_user_id}
+
+
+@app.get("/conversation/{sid}", response_model=HistoryResp)
+def get_conversation(sid: str, authorization: str | None = Header(default=None)) -> HistoryResp:
+    """讀回這位使用者這段對話（前端 F5 / 換裝置後還原上下文）。
+
+    對話歷史本來只活在前端（每次請求原樣帶上來），重整就沒了——但每輪其實都已由
+    persist_turn() 落地 MySQL，這裡只是把那條讀回來的路接通。
+
+    身分只認 token：匿名 → 回空（沒有可還原的東西，不是錯誤）。SQL 同時鎖 sid + end_user_id
+    + is_deleted=0，所以知道別人的 sid 也讀不到、登出軟刪過的對話也不會被還原。
+    """
+    end_user_id = end_user_id_from_token(authorization)
+    rows = memory_store.load_history(sid, end_user_id)
+    return HistoryResp(
+        sid=sid,
+        history=[
+            HistoryMsg(
+                role=r["role"], content=r["content"],
+                sources=[Source(**{k: s.get(k, "") for k in ("title", "url", "created_at", "source")})
+                         for s in r.get("sources", []) if s.get("url")],
+            )
+            for r in rows
+        ],
+    )
+
+
+@app.get("/conversations", response_model=list[ConversationBrief])
+def list_conversations(authorization: str | None = Header(default=None)) -> list[ConversationBrief]:
+    """列出這位使用者未刪除的對話（新→舊）。匿名 → 空清單。"""
+    end_user_id = end_user_id_from_token(authorization)
+    return [ConversationBrief(**c) for c in memory_store.list_conversations(end_user_id)]
 
 
 # ---------------------------------------------------------------------------

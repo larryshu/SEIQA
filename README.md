@@ -132,7 +132,7 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 | 記憶層 | 存哪 | 存什麼 | 生命週期 |
 |---|---|---|---|
 | **短期**・檢索快取（方案 A）| 程序記憶體 `SessionFreshStore` | 當次查到的社群貼文 | 當次 session，用完即丟 |
-| **中期**・對話紀錄 | 後台 MySQL `conversation` / `message` | 每輪 Q/A（`memory_store.persist_turn`）| 落地保存、可在後台檢視；登出軟刪 |
+| **中期**・對話紀錄 | 後台 MySQL `conversation` / `message` | 每輪 Q/A（`memory_store.persist_turn`）| 落地保存、可在後台檢視；**前端可用 `GET /conversation/{sid}` 讀回**；登出軟刪 |
 | **長期・事實**（atomic）| Qdrant `user_memory`（`kind=turn/session_summary`）| LLM 萃取「關於使用者本人的穩定事實」；**點狀語意召回**（`recall`，門檻 0.35）| 跨 session 保留，**僅登入者** |
 | **長期・脈絡**（thread / episodic）| Qdrant `user_memory`（`kind=thread`）| 登出時把整場對話濃縮成**一筆有脈絡敘事**（headline 檢索／narrative 重載）；相關問題**整段重載**（`recall_threads`，門檻 0.42）| 跨 session 保留，**僅登入者** |
 
@@ -143,6 +143,13 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 - **偏好推論比記憶保守**（因為會確定性且靜默地改變行為，例如誤設 `excluded_platforms` 會默默關掉資料源）：只收白名單 key、值域受限、過信心門檻（`PREF_INFER_MIN_CONFIDENCE`，預設 0.75），且 `source='manual'` 的人工設定**永不被覆寫**。
 - **取值優先序**（runtime 解析）：`user_preference` > `agent` > `system_setting`。
 - **只有登入使用者**才有長期記憶與對話歸戶；匿名照常能問答但不留記憶。全程 fail-safe：記憶那層炸掉也不影響回答。
+- **短期對話（上下文）由前端帶、後端無狀態**：`/ask`、`/ws/ask`、`/logout` 都吃同一個 `history` 欄位，`_build_context()` 直接把它攤進 LLM 的 messages。好處是後端不必管 session 生命週期；代價是前端那份 history 一掉，上下文就斷了——即使訊息早已落地 MySQL。故補上**還原路徑** `GET /conversation/{sid}`（另有 `GET /conversations` 列出使用者的對話、`GET /me` 驗 token 是否過期）：SQL 同時鎖 `sid + end_user_id + is_deleted=0`，所以知道別人的 sid 也讀不到、登出軟刪過的對話也不會被還原。**只在開場還原時讀 DB，不是每輪都從 DB 重建 messages**（後端維持無狀態）。
+
+  | | Streamlit | `/demo` 頁 |
+  |---|---|---|
+  | sid | 網址 query param | 網址 query param |
+  | history | 伺服器磁碟 `.sessions/{sid}.json` | `localStorage`（備份）+ 開場向 `GET /conversation/{sid}` 要權威版本 |
+  | token | `st.session_state`（重整即失效） | `localStorage`，開場用 `GET /me` 驗證是否過期 |
 
 **登入 / 登出流程（as-built）**：Streamlit 向 Django `end-auth` 拿 JWT（共用 `TOKEN_SECRET`、HS256），聊天帶 `Authorization: Bearer`；runtime 驗證取 `end_user_id`（失敗即匿名）。**登出**（`POST /logout`）把整段對話 ①摘要成長期事實**＋一筆脈絡敘事（thread）**寫入 `user_memory`、②推論可執行偏好寫入 `user_preference`、③軟刪原始對話，回 `{ok, summarized, inferred, deleted_rows}`（`summarized` 含事實與 thread 條數）。
 
@@ -280,11 +287,13 @@ erDiagram
 
 - Base path `/api/v1/`；**runtime 不走 API、直接讀 DB**。權限分 `admin` / `editor` / `viewer`。
 - **認證（雙身分）**：`/auth/*` 給後台操作者（Django `auth_user`）、`/end-auth/*` 給終端使用者（`end_user`，回 JWT 供 Streamlit），兩套互不混用。
-- **四模組 CRUD**：
-  - Agent：`/agents/`（+`activate`、`test-run`）、`/skills/`、`/source-platforms/`（+`configs`）
-  - 帳戶：`/operators/`、`/end-users/`（+`disable`）、`/api-keys/`、`/audit-logs/`
+- **四模組 CRUD（as-built）**：
+  - Agent：`/agents/`（+`activate`；`test-run` 目前回 501 樁）、`/skills/`、`/source-platforms/`（+`configs`）
+  - 帳戶：`/auth/*`（操作者 JWT：login / refresh / logout / me）、`/end-auth/{register,login}/`（終端使用者）
   - 記憶：`/conversations/`（列表分頁、`messages`、`export`、`purge`）、`/memory-collections/`（+`sync`）
   - 偏好：`/system-settings/`、`/end-users/{id}/preferences/`
+
+> ⚠️ **spec §7.3 與實作的落差**：規格列的帳戶管理 REST API（`/operators/`、`/roles/`、`/end-users/` CRUD、`/api-keys/`、`/audit-logs/`）**尚未實作成 DRF endpoint**。這些管理動作目前一律走 **Django Admin**（`accounts/admin.py` 已註冊 `EndUser` / `ApiKey` / `AuditLog`，含批次動作），符合 spec §14 決議四「後台前端先用 Django Admin 過渡」。`accounts` 的 DRF 路由**只有**認證那兩組。
 
 ### 5.5 Runtime 整合：FastAPI 如何讀 MySQL
 
@@ -332,13 +341,14 @@ SEIQA/
 │   tools.py                # 單一 skill：community_search
 │   agent.py                # 規劃→工具→行動 的多輪 loop
 │   config_repo.py          # ConfigRepository：唯讀讀後台 MySQL 設定（短 TTL 快取 + reload）
-│   memory_store.py         # 每輪對話落地 MySQL（crawl_rw 帳號，fail-safe）
+│   memory_store.py         # 對話落地 MySQL（persist_turn / soft_delete）+ 讀回歷史（load_history / list_conversations）
 │   user_memory.py          # 使用者長期語意記憶（Qdrant：萃取事實 → 注入 prompt）
 │   user_preference.py      # 使用者偏好自動推論（登出時萃取設定旋鈕 → MySQL user_preference）
 │   auth.py                 # 驗證 Django 簽發的終端 token → end_user_id（失敗即匿名）
 │   progress.py             # 即時事件匯流排 + 取消號誌（contextvars；無訂閱者時 no-op）
-│   api.py                  # FastAPI：/ask、/ws/ask、/logout、/demo、/demo/auth/*、/health、/internal/reload-config
-│   static/ws_demo.html     # WebSocket 前端：agent 即時進度 + 逐字串流 + 停止鈕 + 登入/登出
+│   api.py                  # FastAPI：/ask、/ws/ask、/logout、/me、/conversation/{sid}、/conversations、
+│                           #          /demo、/demo/auth/*、/health、/internal/reload-config
+│   static/ws_demo.html     # WebSocket 前端：即時進度 + 逐字串流 + 停止鈕 + 登入/登出 + F5 還原對話
 ├─ ui/streamlit_app.py      # Streamlit 聊天前端（🟢/🟡 燈號 + 來源分組 + 登入/登出；走阻塞 /ask）
 ├─ admin_backend/           # Django + DRF 後台（accounts / agents / memory / preferences）
 ├─ docs/admin_backend_spec.md   # 後台完整規格（本檔的來源之一）
@@ -379,8 +389,8 @@ python -m venv .venv-admin
 
 | 前端 | 網址 | 特性 |
 |---|---|---|
-| WebSocket demo（`start.ps1` 自動開） | http://localhost:8001/demo | agent 即時進度、逐字串流、**中途可停止**、來源依平台分組收合 |
-| Streamlit | http://localhost:8501 | 阻塞問答（送出後等完整答案），需手動開啟 |
+| WebSocket demo（`start.ps1` 自動開） | http://localhost:8001/demo | agent 即時進度、逐字串流、**中途可停止**、來源依平台分組收合、**F5／換裝置可還原對話**（登入者從 MySQL 讀回） |
+| Streamlit | http://localhost:8501 | 阻塞問答（送出後等完整答案），需手動開啟；F5 從伺服器磁碟 `.sessions/` 讀回 |
 
 **測試**：Swagger UI（http://localhost:8001/docs，注意 WebSocket 不會出現在 OpenAPI）／ curl `POST /ask` ／ 兩個前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則」或「🟡 LLM 既有常識」。兩來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET)` 秒（非相加）——這也正是 `/demo` 要即時推進度的原因。
 
@@ -451,6 +461,7 @@ agent / tools / prompt 都不用動——這就是 registry 的用意。
 | M6 | 後台前端（先用 Django Admin / DRF browsable API） |
 | 追加 | 終端登入（Django 發 token / runtime 驗）、使用者長期記憶、登出摘要、**偏好自動推論** |
 | 追加 | **WebSocket 即時前端**：`progress.py` 事件匯流排、`/ws/ask` 逐字串流、中途取消、`/demo` 頁與登入代理 |
+| 追加 | **對話還原**：`GET /me`、`GET /conversation/{sid}`、`GET /conversations`（`memory_store.load_history`）；`/demo` 頁 sid 進網址 + `localStorage` 備份 → F5／換裝置接得回上下文（落地的 `message` 表從此不再是唯寫） |
 
 > ✅ **as-built**：M0–M6 與個人化記憶／偏好推論皆通過真實 LLM 端到端驗證（後台改 prompt→reload→回答變、`community_search` 雙來源、對話落地、登入後偏好過濾平台 + 對話歸戶、登出摘要與偏好推論）。
 >
