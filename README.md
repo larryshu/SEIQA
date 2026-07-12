@@ -6,8 +6,8 @@
 | 項目 | 內容 |
 |---|---|
 | 定位 | tool-calling 的**多平台社群口碑問答 Agent** + 可設定化後台 |
-| 技術棧 | 前台 runtime：FastAPI · WebSocket · PyMySQL · PyJWT · DrissionPage（Dcard 反爬即時爬）· Qdrant · Azure OpenAI；後台：Django 5 · DRF · MySQL 8；前端：Streamlit（阻塞問答）＋ WebSocket demo 頁（即時進度 / 逐字串流 / 中途取消） |
-| 狀態 | M0–M6 + 終端登入 + 使用者長期記憶/登出 + 偏好自動推論 + WebSocket 即時前端 **皆已實作（as-built）** |
+| 技術棧 | 前台 runtime：FastAPI · WebSocket · PyMySQL · PyJWT · DrissionPage（Dcard 反爬即時爬）· Qdrant · Azure OpenAI；後台：Django 5 · DRF · MySQL 8；前端：Streamlit（阻塞問答）＋ WebSocket demo 頁（即時進度 / 逐字串流 / 中途取消 / 立場分佈圖） |
+| 狀態 | M0–M6 + 終端登入 + 使用者長期記憶/登出 + 偏好自動推論 + WebSocket 即時前端 + 立場統計與圖表 **皆已實作（as-built）** |
 
 ---
 
@@ -37,7 +37,8 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 
 ### 技術亮點
 
-- **原生 tool-calling Agent**：不靠框架，LLM 自行規劃是否查、查什麼；`community_search` 一個 skill 對外，內部並行 fan-out 多平台。
+- **原生 tool-calling Agent**：不靠框架，LLM 自行規劃是否查、查什麼；**兩個 skill —— `community_search`（查）與 `stance_breakdown`（算）**，一個對外查詢、內部並行 fan-out 多平台，一個把撈到的討論統計成可畫圖的分佈。
+- **統計不交給 LLM（`stance_breakdown` + 圖表）**：直接問模型「大概幾成？」它會回「六四開」——那個數字沒有人數過。所以拆成 **LLM 只做逐則分類、Python 用 `Counter` 加總**；每一片圓餅都帶 `[n]` 回得去原文，樣本 < 8 則只秀則數不秀百分比。圖由前端手刻 SVG 畫（零前端相依），**prompt 明令模型不准自己估比例、不准用文字符號拼圖表**。
 - **雙來源即時爬 + 反爬**：**Dcard 用 DrissionPage 驅動真實 Chrome 過 Cloudflare 即時爬**、PTT 用 requests 即時爬，**「兩邊都查」是程式層保證**；Dcard 另備離線向量庫當 fallback（即時爬失敗自動退回）。
 - **Registry + adapter 擴充性**：加平台＝多寫一個 adapter，agent / prompt / loop 全不動；連 Dcard 的「即時爬↔向量庫」切換也靠這層乾淨接起來（`DCARD_MODE`）。
 - **設定資料庫化**：prompt / 模型 / 平台開關 / 檢索門檻全搬進 MySQL，後台改設定**免改程式碼**；runtime 唯讀讀取 + 短 TTL 快取。
@@ -87,9 +88,9 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 
 ## 3. Agent 與檢索設計
 
-### 3.1 一個 skill，多個來源 adapter（registry + 並行 fan-out）
+### 3.1 一個查詢 skill，多個來源 adapter（registry + 並行 fan-out）
 
-對 LLM **只暴露一個工具** `community_search`；底下掛一個**來源 registry**，每個平台是一個 adapter，把該平台包成統一的 `fetch(query) -> list[Post]`。查詢時**並行 fan-out** 到所有 adapter、合併結果（每篇帶 `source` 平台標籤）。
+對 LLM 暴露的**查詢工具只有一個** `community_search`（另一個 skill `stance_breakdown` 不查、只統計，見 [§3.4](#34-立場統計與圖表stance_breakdown)）；底下掛一個**來源 registry**，每個平台是一個 adapter，把該平台包成統一的 `fetch(query) -> list[Post]`。查詢時**並行 fan-out** 到所有 adapter、合併結果（每篇帶 `source` 平台標籤）。
 
 **加新平台＝在 `sources.py` 多寫一個 adapter、加進 `REGISTRY` 即可——agent / loop / prompt 全部不動。** 這也保證「每次兩邊都查」是程式層保證的，不靠 LLM 自己記得同時叫多個工具。
 
@@ -115,13 +116,32 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 `/ask` 是阻塞請求：Dcard 時間預算 100s、PTT 60s（並行），最壞情況使用者盯著 spinner 等近兩分鐘、毫無回饋。`/ws/ask` 就是為了解決這件事，而 `/ask` 原封不動保留。
 
 - **事件匯流排 `app/progress.py`**：用 `contextvars` 傳遞 emitter 與取消號誌，而不是改函式簽章——所以 `Source.fetch()` 介面不變，README 承諾的「加平台＝只寫一個 adapter」依然成立。**沒有訂閱者時 `emit()` 是 no-op**，`/ask` 行為一個位元都沒變。fan-out 的每個 future 各複製一份 `Context`（同一個 `Context` 不能被兩條執行緒同時 `run`）。
-- **事件流**：`stage` → `crawl_plan` → `crawl_search` → `crawl_progress`（就地更新）→ `source_fallback` / `source_error` → `source_done` → `search_done` → `token`（逐字）→ `done` / `cancelled` / `error`。其中 **`source_fallback` 讓原本只寫進後端 log 的分層降級，變成使用者看得見的產品行為**。
+- **事件流**：`stage` → `crawl_plan` → `crawl_search` → `crawl_progress`（就地更新）→ `source_fallback` / `source_error` → `source_done` → `search_done` →（若有統計）`stance_progress` → `chart` → `token`（逐字）→ `done` / `cancelled` / `error`。其中 **`source_fallback` 讓原本只寫進後端 log 的分層降級，變成使用者看得見的產品行為**；`chart` 則讓圖在模型還沒開口前就先畫出來。
 - **逐字串流**：`llm.chat_with_tools_stream()`。串流時 `tool_calls` 的 `arguments` 是一片一片吐出的（`name`/`id` 只在首片），依 `delta.index` 分槽累積才拼得回來。
 - **取消**：`progress.Cancelled` 刻意繼承 **`BaseException` 而非 `Exception`**。底層到處是 fail-safe 的 `except Exception`，其中 `dcard_live.crawl()` 會把攔到的例外解讀成「即時爬失敗 → 退回向量庫」；若取消是普通 `Exception`，使用者按停止會誤觸一次沒必要的 fallback。（標準庫的 `asyncio.CancelledError` 基於同一理由這樣設計。）fan-out 用 `fut.result(timeout=0.5)` 輪詢而非死等，前端 0.5 秒內收到 `cancelled`。
   > **已知限制**：DrissionPage 是阻塞的、無法從外部中斷，取消只是「不再等它」——那顆 Chrome 會握著單例鎖跑到時間預算結束。所以取消後立刻再問一題，Dcard 那條會排隊（PTT 不受影響）。
 - **認證是 per-connection 的**：瀏覽器的 WebSocket API 不能帶自訂 header，所以 token 走 query string（`/ws/ask?token=<jwt>`），而且**握手時只讀一次**——登入 / 登出後必須斷線重連。這與 HTTP 每個 request 都能換 header 不同。
 - **登入代理 `/demo/auth/{login,register}`**：demo 頁由 runtime（:8001）提供、Django 在 :8000，瀏覽器直接打是跨來源請求，而後台沒裝 `django-cors-headers`。改由 runtime 在伺服器端轉發，瀏覽器全程同源。Streamlit 不會遇到這問題，因為它的 `requests.post` 本來就跑在伺服器端。
 - **併發模型**：整條連線只有**一個 reader 協程**呼叫 `receive()`（Starlette 不允許並行 receive），`cancel` 就地處理、其餘訊息排進佇列；agent 跑在 `asyncio.to_thread` 的 worker thread，事件經 `loop.call_soon_threadsafe` 回到事件迴圈。
+
+### 3.4 立場統計與圖表（`stance_breakdown`）
+
+使用者問「正反意見幾成？」時，直接問 LLM 會得到「大概六四開」——**那個 60% 沒有人數過**。一旦畫成圓餅圖，假精確度就被放大成看起來像事實的東西，與本專案「🟢🟡 燈號 + `[n]` 來源 + 明講哪個平台沒資料」的反幻覺原則直接牴觸。
+
+所以第二個 skill 把工作切成兩半（`app/stance.py`）：
+
+- **LLM 只做分類**：對每一則已撈到的貼文，判斷作者對「議題陳述句」的立場（逐批 10 則、`temperature=0`、只收在分類軸內的標籤，模型自創的類別一律丟掉）。
+- **Python 做統計**：`Counter` 加總、算百分比、拆 `by_platform`、判斷樣本夠不夠。
+
+| 設計 | 為什麼 |
+|---|---|
+| **分類軸可自訂**（`categories`，2–5 類） | 使用者問的不一定是贊成／反對。問「大家是同情、嘲笑、還是無感？」要的是**態度**，硬套贊成／反對只會答非所問；留空＝預設贊成／反對／中立 |
+| **每片圓餅都帶 `[n]`** | 點得回原文——圖跟答案一樣要可查證；滑過去還能看到「它為什麼被判成這一類」 |
+| **`low_sample`（< 8 則）** | 3 則裡的 2 則不該被講成 67%。低於門檻前端只秀則數 + 警語，工具回給 LLM 的字串也叫它講清楚「這是樣本、不是民意」 |
+| **不重爬** | 只統計「已經抓到的貼文」。這一輪沒查 → 沿用本次 session 先前抓到的（`store.all()`），所以「根據上面的結論畫個圖」這種**追問不會再爬一次** |
+| **圖由前端畫** | 後端 `emit("chart", **data)` 推結構化數據，前端手刻 SVG 圓餅（零前端相依）。**prompt 明令模型不准自己估比例、不准用文字方塊拼圖表**——那不是圖，是雜訊 |
+
+因此 `MAX_TOOL_ROUNDS` 從 1 改成 **2**（第一輪 `community_search` 撈、第二輪 `stance_breakdown` 算），並在輪數用完後補一刀 `tool_choice="none"` 收尾：不准再叫工具，逼模型用手上的資料吐文字，否則使用者會看到「已達工具呼叫上限」那句廢話。統計結果一路帶回 `/ask` 的 `chart` 欄位與 `done` 事件，**兩個前端都拿得到**。
 
 ---
 
@@ -337,8 +357,9 @@ SEIQA/
 │   vectorstore.py          # Dcard fallback 向量檢索（Qdrant REST，多面向 + 門檻；即時爬失敗時用）
 │   ptt.py                  # PTT 即時爬蟲（requests + bs4，over18 + 時間預算 + 限速 + 重試）
 │   sources.py              # 來源 registry：Source 抽象 + DcardLiveSource(→向量 fallback)/PttSource + 並行 fan-out
-│   store.py                # FreshStore 抽象 + SessionFreshStore(A) + QdrantHotStore(B 預留)
-│   tools.py                # 單一 skill：community_search
+│   store.py                # FreshStore 抽象 + SessionFreshStore(A) + QdrantHotStore(B 預留)；all() 供追問回讀
+│   tools.py                # 兩個 skill：community_search（查）+ stance_breakdown（算）
+│   stance.py               # 立場統計：LLM 逐則分類 → Python Counter 加總（LLM 不估比例、不畫圖）
 │   agent.py                # 規劃→工具→行動 的多輪 loop
 │   config_repo.py          # ConfigRepository：唯讀讀後台 MySQL 設定（短 TTL 快取 + reload）
 │   memory_store.py         # 對話落地 MySQL（persist_turn / soft_delete）+ 讀回歷史（load_history / list_conversations）
@@ -348,7 +369,7 @@ SEIQA/
 │   progress.py             # 即時事件匯流排 + 取消號誌（contextvars；無訂閱者時 no-op）
 │   api.py                  # FastAPI：/ask、/ws/ask、/logout、/me、/conversation/{sid}、/conversations、
 │                           #          /demo、/demo/auth/*、/health、/internal/reload-config
-│   static/ws_demo.html     # WebSocket 前端：即時進度 + 逐字串流 + 停止鈕 + 登入/登出 + F5 還原對話
+│   static/ws_demo.html     # WebSocket 前端：即時進度 + 逐字串流 + 停止鈕 + 立場分佈圓餅圖(SVG) + 登入/登出 + F5 還原對話
 ├─ ui/streamlit_app.py      # Streamlit 聊天前端（🟢/🟡 燈號 + 來源分組 + 登入/登出；走阻塞 /ask）
 ├─ admin_backend/           # Django + DRF 後台（accounts / agents / memory / preferences）
 ├─ docs/admin_backend_spec.md   # 後台完整規格（本檔的來源之一）
@@ -389,7 +410,7 @@ python -m venv .venv-admin
 
 | 前端 | 網址 | 特性 |
 |---|---|---|
-| WebSocket demo（`start.ps1` 自動開） | http://localhost:8001/demo | agent 即時進度、逐字串流、**中途可停止**、來源依平台分組收合、**F5／換裝置可還原對話**（登入者從 MySQL 讀回） |
+| WebSocket demo（`start.ps1` 自動開） | http://localhost:8001/demo | agent 即時進度、逐字串流、**中途可停止**、來源依平台分組收合、**立場分佈圓餅圖**（問「正反幾成」時）、**F5／換裝置可還原對話**（登入者從 MySQL 讀回） |
 | Streamlit | http://localhost:8501 | 阻塞問答（送出後等完整答案），需手動開啟；F5 從伺服器磁碟 `.sessions/` 讀回 |
 
 **測試**：Swagger UI（http://localhost:8001/docs，注意 WebSocket 不會出現在 OpenAPI）／ curl `POST /ask` ／ 兩個前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則」或「🟡 LLM 既有常識」。兩來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET)` 秒（非相加）——這也正是 `/demo` 要即時推進度的原因。
@@ -462,6 +483,7 @@ agent / tools / prompt 都不用動——這就是 registry 的用意。
 | 追加 | 終端登入（Django 發 token / runtime 驗）、使用者長期記憶、登出摘要、**偏好自動推論** |
 | 追加 | **WebSocket 即時前端**：`progress.py` 事件匯流排、`/ws/ask` 逐字串流、中途取消、`/demo` 頁與登入代理 |
 | 追加 | **對話還原**：`GET /me`、`GET /conversation/{sid}`、`GET /conversations`（`memory_store.load_history`）；`/demo` 頁 sid 進網址 + `localStorage` 備份 → F5／換裝置接得回上下文（落地的 `message` 表從此不再是唯寫） |
+| 追加 | **立場統計與圖表**：第二個 skill `stance_breakdown`（`app/stance.py`）——LLM 逐則分類、Python `Counter` 加總、前端手刻 SVG 圓餅；`MAX_TOOL_ROUNDS` 1→2 + `tool_choice="none"` 收尾；`store.all()` 讓追問不重爬 |
 
 > ✅ **as-built**：M0–M6 與個人化記憶／偏好推論皆通過真實 LLM 端到端驗證（後台改 prompt→reload→回答變、`community_search` 雙來源、對話落地、登入後偏好過濾平台 + 對話歸戶、登出摘要與偏好推論）。
 >

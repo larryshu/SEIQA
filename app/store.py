@@ -21,6 +21,14 @@ class FreshStore(ABC):
     def search(self, session_id: str, query: str, top_k: int = 5) -> list[Post]:
         """從已存的 live 資料找出與 query 相關的貼文。"""
 
+    @abstractmethod
+    def all(self, session_id: str) -> list[Post]:
+        """這個 session 目前存了哪些貼文（依存入順序）。
+
+        給「追問」用：使用者說「根據上面的結論畫個圖」時，那一輪不會再爬一次，
+        但上一輪抓到的貼文還在這裡——沒有這條讀回的路，追問就只能眼睜睜看著資料在手邊卻用不到。
+        """
+
 
 class SessionFreshStore(FreshStore):
     """方案 A：純記憶體、依 session 隔離。簡單關鍵字命中即可，不需 embedding。"""
@@ -44,6 +52,9 @@ class SessionFreshStore(FreshStore):
         ranked = sorted(bucket, key=score, reverse=True)
         return [p for p in ranked if score(p) > 0][:top_k] or bucket[:top_k]
 
+    def all(self, session_id: str) -> list[Post]:
+        return list(self._by_session.get(session_id, []))
+
 
 class QdrantHotStore(FreshStore):
     """方案 B（預留）：要展示「記憶累積、越用越強」時才實作。
@@ -57,6 +68,9 @@ class QdrantHotStore(FreshStore):
         raise NotImplementedError("方案 B 尚未實作；要持久化累積記憶時再開。")
 
     def search(self, session_id: str, query: str, top_k: int = 5) -> list[Post]:
+        raise NotImplementedError("方案 B 尚未實作；要持久化累積記憶時再開。")
+
+    def all(self, session_id: str) -> list[Post]:
         raise NotImplementedError("方案 B 尚未實作；要持久化累積記憶時再開。")
 
 

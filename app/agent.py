@@ -42,11 +42,21 @@ SYSTEM_PROMPT = (
     "當某個具體說法來自抓到的討論時，在句尾自然帶上 [n]，不用每句都標、"
     "也不要讓來源變成回答的主角。不要杜撰來源。"
     "\n\n"
+    "【比例與圖表】"
+    "當使用者問『比例』『幾成』『多少人覺得』『正反意見如何』或要圖表時，"
+    "先 community_search 撈討論，再呼叫 stance_breakdown 工具做立場統計——它會逐則判讀並"
+    "由程式加總，前端會直接把結果畫成圖。"
+    "**你自己絕對不要估算百分比**（沒數過的『大概六四開』就是杜撰），"
+    "**也絕對不要用文字、方塊或符號拼出長條圖／圓餅圖**——那不是圖，是雜訊。"
+    "統計出來之後，你的工作是用『文字』解釋這個分佈代表什麼、兩邊各在意什麼。"
+    "\n\n"
     "【兩邊都沒有相關資料時】"
     "就以朋友的身分用既有常識／經驗給建議，並誠實說這次沒在 Dcard 與 PTT 找到相關討論。"
 )
 
-MAX_TOOL_ROUNDS = 1  # 一題查 1 次（community_search 內部已並行查兩邊），一輪足夠
+# 2 輪：一輪 community_search 撈討論，必要時第二輪 stance_breakdown 做立場統計。
+# （單一 community_search 內部已並行查兩邊，所以「查」本身一輪就夠。）
+MAX_TOOL_ROUNDS = 2
 
 
 def _apply_pref_modifiers(prompt: str, prefs: dict) -> str:
@@ -147,36 +157,43 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
 
     used_tools: list[str] = []
     sources: list[dict] = []  # 實際抓到的來源（依 [n] 順序），供前端渲染
+    charts: list[dict] = []   # stance_breakdown 的統計結果（有呼叫才會有）
     for _ in range(ctx.max_rounds):
         msg = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model)
         if not msg.tool_calls:
             messages.append({"role": "assistant", "content": msg.content or ""})
-            return {"answer": msg.content or "", "used_tools": used_tools,
-                    "sources": sources, "messages": messages}
+            return {"answer": msg.content or "", "used_tools": used_tools, "sources": sources,
+                    "chart": charts[-1] if charts else None, "messages": messages}
 
         # 有 tool_calls：先把 assistant 這輪（含 tool_calls）原樣存回，再逐一執行
         messages.append(msg.model_dump(exclude_none=True))
         for tc in msg.tool_calls:
             used_tools.append(tc.function.name)
             result = dispatch(tc.function.name, tc.function.arguments, session_id,
-                              user_query=user_message, sources=sources, end_user_id=end_user_id)
+                              user_query=user_message, sources=sources,
+                              end_user_id=end_user_id, charts=charts)
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result}
             )
 
-    # 連續呼叫工具到上限仍沒收斂 → 強制要一次純文字總結
-    final = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model)
+    # 工具輪數用完 → 收尾這一刀 tool_choice="none"：不准再叫工具，逼它用手上的資料回話。
+    # （否則模型可能再要一次工具、content 回空，使用者就會看到「已達工具呼叫上限」那句廢話。）
+    final = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model,
+                            tool_choice="none")
     answer = final.content or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
     messages.append({"role": "assistant", "content": answer})
-    return {"answer": answer, "used_tools": used_tools, "sources": sources, "messages": messages}
+    return {"answer": answer, "used_tools": used_tools, "sources": sources,
+            "chart": charts[-1] if charts else None, "messages": messages}
 
 
-def _stream_once(ctx: _RunContext, messages: list[dict]) -> tuple[dict, bool]:
+def _stream_once(ctx: _RunContext, messages: list[dict],
+                 tool_choice: str = "auto") -> tuple[dict, bool]:
     """跑一次串流補全：token 邊收邊 emit。回 (assistant message dict, 是否吐過 token)。"""
     streamed = False
     msg: dict = {}
     for kind, payload in llm.chat_with_tools_stream(
-            messages, ctx.tools, temperature=ctx.temperature, model=ctx.model):
+            messages, ctx.tools, temperature=ctx.temperature, model=ctx.model,
+            tool_choice=tool_choice):
         if kind == "token":
             streamed = True
             progress.emit("token", text=payload)
@@ -196,6 +213,7 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
 
     used_tools: list[str] = []
     sources: list[dict] = []
+    charts: list[dict] = []
     progress.emit("stage", stage="planning", text="判斷這題需不需要查社群討論…")
 
     for _ in range(ctx.max_rounds):
@@ -207,8 +225,8 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
             if not streamed:  # 模型沒串出東西（極少見）→ 補送一次，前端才有內容
                 progress.emit("token", text=answer)
             messages.append({"role": "assistant", "content": answer})
-            return {"answer": answer, "used_tools": used_tools,
-                    "sources": sources, "messages": messages}
+            return {"answer": answer, "used_tools": used_tools, "sources": sources,
+                    "chart": charts[-1] if charts else None, "messages": messages}
 
         # 少數模型會在決定用工具前先吐幾個字。那些字不是答案 → 請前端把已印出的清掉。
         if streamed:
@@ -221,15 +239,17 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
             used_tools.append(name)
             progress.emit("tool_start", tool=name, arguments=tc["function"]["arguments"])
             result = dispatch(name, tc["function"]["arguments"], session_id,
-                              user_query=user_message, sources=sources, end_user_id=end_user_id)
+                              user_query=user_message, sources=sources,
+                              end_user_id=end_user_id, charts=charts)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
             progress.emit("tool_done", tool=name, found=len(sources))
 
     progress.raise_if_cancelled()
     progress.emit("stage", stage="answering", text="讀完討論了，開始生成回答…")
-    final, streamed = _stream_once(ctx, messages)
+    final, streamed = _stream_once(ctx, messages, tool_choice="none")  # 收尾：不准再叫工具
     answer = final.get("content") or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
     if not streamed:
         progress.emit("token", text=answer)
     messages.append({"role": "assistant", "content": answer})
-    return {"answer": answer, "used_tools": used_tools, "sources": sources, "messages": messages}
+    return {"answer": answer, "used_tools": used_tools, "sources": sources,
+            "chart": charts[-1] if charts else None, "messages": messages}

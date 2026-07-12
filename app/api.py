@@ -48,6 +48,8 @@ class AskResp(BaseModel):
     answer: str
     used_tools: list[str]
     sources: list[Source] = []  # 實際抓到的來源（依 [n] 順序），前端渲染用
+    # 有呼叫 stance_breakdown 才有：立場分佈的結構化數據，由前端畫圖（LLM 不畫圖、不估比例）
+    chart: dict | None = None
 
 
 class LogoutReq(BaseModel):
@@ -111,7 +113,8 @@ def ask(req: AskReq, authorization: str | None = Header(default=None)) -> AskRes
     )
     # 個人化長期記憶：萃取『使用者事實』後存進向量記憶（fail-safe；匿名/無事實自動略過）
     user_memory.remember(end_user_id, req.message, result["answer"], session_id=req.session_id)
-    return AskResp(answer=result["answer"], used_tools=result["used_tools"], sources=sources)
+    return AskResp(answer=result["answer"], used_tools=result["used_tools"], sources=sources,
+                   chart=result.get("chart"))
 
 
 @app.post("/logout", response_model=LogoutResp)
@@ -253,6 +256,7 @@ def _run_blocking(question: str, history: list[dict], session_id: str,
         "used_tools": result.get("used_tools", []),
         "sources": [s for s in sources if s.get("url")],
         "light": "green" if sources else "yellow",  # 🟢 有社群來源／🟡 LLM 既有常識
+        "chart": result.get("chart"),  # 圖表已由 chart 事件即時畫出；這裡帶著是為了 /ask 與還原
     })
 
 

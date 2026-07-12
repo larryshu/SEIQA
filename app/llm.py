@@ -77,17 +77,18 @@ def expand_queries(question: str, n: int = 3) -> list[str]:
 
 
 def chat_with_tools(messages: list[dict], tools: list[dict], temperature: float = 0.2,
-                    model: str | None = None):
+                    model: str | None = None, tool_choice: str = "auto"):
     """掛上工具的補全：回傳 message 物件，呼叫端自行判斷有沒有 tool_calls。
 
     model 留空＝用 settings.chat_model（.env）；後台啟用的 agent 會帶入自己的 model（M3）。
+    tool_choice="none"：不准再叫工具，一定要吐文字——agent loop 的「最後一刀」用它收尾。
     """
     resp = _client().chat.completions.create(
         model=model or settings.chat_model,
         temperature=temperature,
         messages=messages,
         tools=tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,
     )
     return resp.choices[0].message
 
@@ -112,7 +113,8 @@ def _merge_tool_call_deltas(acc: dict[int, dict], deltas) -> None:
 
 
 def chat_with_tools_stream(messages: list[dict], tools: list[dict], temperature: float = 0.2,
-                           model: str | None = None) -> Iterator[tuple[str, object]]:
+                           model: str | None = None,
+                           tool_choice: str = "auto") -> Iterator[tuple[str, object]]:
     """chat_with_tools 的串流版。逐一 yield ('token', 文字片段)，最後 yield ('message', dict)。
 
     最後那個 message dict 的形狀與非串流版的 message.model_dump(exclude_none=True) 對齊
@@ -126,7 +128,7 @@ def chat_with_tools_stream(messages: list[dict], tools: list[dict], temperature:
         temperature=temperature,
         messages=messages,
         tools=tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,   # "none" ＝ 收尾那一刀，強制吐文字（見 chat_with_tools）
         stream=True,
     )
     content_parts: list[str] = []

@@ -20,7 +20,7 @@ ROADMAP.md
 *ppt.py
 *.txt
 *.pptx
-
+interview_iei.md
 # 但依賴清單必須入庫，否則 clone 下來裝不了東西（上面的 *.txt 會把它一起吃掉）
 !requirements.txt
 !requirements-admin.txt

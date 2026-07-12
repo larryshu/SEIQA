@@ -73,6 +73,24 @@
   .sources a { color:var(--accent); text-decoration:none; }
   .sources a:hover { text-decoration:underline; }
 
+  /* 立場分佈圖（stance_breakdown）：資料由後端「數」出來，這裡只負責畫 */
+  .chart { margin-top:16px; border:1px solid var(--line); border-radius:10px;
+           padding:14px 16px; background:var(--panel); font-size:13px; }
+  .chart .issue { color:var(--muted); font-size:12.5px; margin-bottom:12px; }
+  .chart .body { display:flex; gap:20px; align-items:center; flex-wrap:wrap; }
+  .chart ul { list-style:none; margin:0; padding:0; flex:1; min-width:220px; }
+  .chart li { display:flex; align-items:baseline; gap:8px; margin:7px 0; }
+  .chart .dot { width:10px; height:10px; border-radius:3px; flex:none; }
+  .chart .n { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .chart .refs { margin-left:auto; }
+  .chart .refs a { color:var(--muted); text-decoration:none; font-size:11.5px; margin-left:3px; }
+  .chart .refs a:hover { color:var(--accent); text-decoration:underline; }
+  .chart .split { margin-top:12px; padding-top:10px; border-top:1px solid var(--line);
+                  color:var(--muted); font-size:12px; }
+  .chart .low { margin-top:10px; color:#854d0e; background:var(--warn-bg);
+                border-left:3px solid var(--warn-line); padding:6px 10px; border-radius:3px;
+                font-size:12px; }
+
   /* 底部輸入列 */
   footer { border-top:1px solid var(--line); padding:14px 20px; display:flex; gap:8px; }
   input, button { font:inherit; border-radius:8px; border:1px solid var(--line); }
@@ -218,13 +236,16 @@ function newTurn(question) {
   light.className = "light";
   const answer = document.createElement("div");
   answer.className = "answer streaming";
+  const chart = document.createElement("div");
+  chart.className = "chart";
+  chart.style.display = "none";
   const sources = document.createElement("div");
   sources.className = "sources";
   sources.style.display = "none";
-  wrap.append(user, light, answer, sources);
+  wrap.append(user, light, answer, chart, sources);
   $("chat").appendChild(wrap);
   $("chat").scrollTop = 1e9;
-  return { wrap, light, answer, sources, text: "" };
+  return { wrap, light, answer, chart, sources, text: "" };
 }
 
 // 顯示順序固定；最後一組（空字串 key）收容未知平台，加平台時沒對應到就不會憑空消失
@@ -273,6 +294,113 @@ function renderSources(box, list) {
   box.style.display = "block";
 }
 
+/* ---------- 立場分佈圓餅圖 ----------
+   資料是後端「數」出來的（stance.py 逐則分類 + Counter 加總），這裡只負責畫。
+   每一片都列出它的 [n]，點得回原文——圖跟答案一樣要可查證。 */
+// 預設那三類固定配色（贊成永遠是綠的，看圖的人不用重新學）；
+// 自訂分類軸（例如同情／嘲笑／無感）沒有語意色，就按順序取調色盤。
+const STANCE_COLOR = { "贊成": "var(--green)", "反對": "var(--red)", "中立": "var(--muted)" };
+const PALETTE = ["var(--accent)", "var(--red)", "var(--muted)", "var(--green)", "var(--yellow)"];
+const colorOf = (stance, i) => STANCE_COLOR[stance] || PALETTE[i % PALETTE.length];
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function arc(cx, cy, r, from, to) {
+  const p = a => [cx + r * Math.cos(a * Math.PI / 180), cy + r * Math.sin(a * Math.PI / 180)];
+  const [x1, y1] = p(from), [x2, y2] = p(to);
+  return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${to - from > 180 ? 1 : 0} 1 ${x2} ${y2} Z`;
+}
+
+function pie(counts, total) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 160 160");
+  svg.setAttribute("width", "150");
+  svg.setAttribute("height", "150");
+  let angle = -90;                                  // 從正上方開始，順時針
+  Object.entries(counts).forEach(([stance, n], i) => {
+    if (!n) return;
+    const sweep = n * 360 / total;
+    const shape = sweep >= 359.999                  // 只有一種立場：整圓（弧線畫不出 360°）
+      ? document.createElementNS(SVG_NS, "circle")
+      : document.createElementNS(SVG_NS, "path");
+    if (shape.tagName === "circle") {
+      shape.setAttribute("cx", 80); shape.setAttribute("cy", 80); shape.setAttribute("r", 70);
+    } else {
+      shape.setAttribute("d", arc(80, 80, 70, angle, angle + sweep));
+    }
+    shape.setAttribute("fill", colorOf(stance, i));
+    shape.setAttribute("stroke", "var(--bg)");
+    shape.setAttribute("stroke-width", "2");
+    svg.appendChild(shape);
+    angle += sweep;
+  });
+  return svg;
+}
+
+function renderChart(box, data) {
+  box.replaceChildren();
+
+  const heading = document.createElement("h2");
+  heading.textContent = `分佈統計（共 ${data.total} 則）`;   // 分類軸不一定是「立場」
+  const issue = document.createElement("div");
+  issue.className = "issue";
+  issue.textContent = `議題：${data.issue}`;        // textContent：議題字串由 LLM 產生，不當 HTML
+
+  const body = document.createElement("div");
+  body.className = "body";
+  body.appendChild(pie(data.counts, data.total));
+
+  const byStance = {};
+  for (const it of data.items || []) (byStance[it.stance] ||= []).push(it);
+
+  const list = document.createElement("ul");
+  Object.entries(data.counts).forEach(([stance, n], i) => {
+    const li = document.createElement("li");
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dot.style.background = colorOf(stance, i);
+    const name = document.createElement("strong");
+    name.textContent = stance;
+    const num = document.createElement("span");
+    num.className = "n";
+    // 樣本太少就只講則數：3 則裡的 2 則說成「67%」是假精確度
+    num.textContent = data.low_sample ? `${n} 則` : `${n} 則 · ${data.percent[stance]}%`;
+
+    const refs = document.createElement("span");
+    refs.className = "refs";
+    for (const it of (byStance[stance] || []).slice(0, 12)) {
+      const a = document.createElement("a");
+      a.href = it.url; a.target = "_blank"; a.rel = "noopener";
+      a.textContent = `[${it.n}]`;
+      a.title = it.why || it.title;                 // 滑過去看這則被判成這個立場的依據
+      refs.appendChild(a);
+    }
+    li.append(dot, name, num, refs);
+    list.appendChild(li);
+  });
+  body.appendChild(list);
+  box.append(heading, issue, body);
+
+  const platforms = Object.entries(data.by_platform || {});
+  if (platforms.length > 1) {                       // 只有一個平台時這行是廢話
+    const split = document.createElement("div");
+    split.className = "split";
+    split.textContent = platforms
+      .map(([p, c]) => `${p}：` + Object.entries(c).map(([s, n]) => `${s} ${n}`).join(" / "))
+      .join("　｜　");
+    box.appendChild(split);
+  }
+
+  if (data.low_sample) {
+    const low = document.createElement("div");
+    low.className = "low";
+    low.textContent = `⚠ 樣本只有 ${data.total} 則（少於 ${data.min_sample} 則）：`
+                    + "這是本次抓到的討論，不代表整體民意，比例僅供參考。";
+    box.appendChild(low);
+  }
+  box.style.display = "block";
+  $("chat").scrollTop = 1e9;
+}
+
 function setLight(node, hasSources) {
   node.innerHTML = hasSources
     ? '<span style="color:var(--green)">🟢 綜合社群討論作答</span>'
@@ -286,11 +414,14 @@ function renderRestored(list) {
     node.answer.classList.remove("streaming");   // 還原的不是正在生成的
     node.answer.textContent = t.a;
     setLight(node.light, (t.sources || []).length > 0);
+    if (t.chart) renderChart(node.chart, t.chart);   // 只有本機備份存得回圖（見 toTurns 註解）
     renderSources(node.sources, t.sources || []);
   }
 }
 
-/** 後端回的是逐則訊息（[{role, content, sources}]），畫面要的是逐輪（q/a）→ 配對成對。 */
+/** 後端回的是逐則訊息（[{role, content, sources}]），畫面要的是逐輪（q/a）→ 配對成對。
+ *  註：立場分佈圖（chart）目前沒有落地到 MySQL 的 message 表，所以走後端還原這條路時
+ *  圖不會回來（本機備份那份才有）。要讓它跨裝置還原，得幫 message 加一個 chart 欄位。 */
 function toTurns(messages) {
   const out = [];
   for (let i = 0; i < messages.length; i++) {
@@ -383,6 +514,12 @@ function handle(ev) {
       break;
     }
 
+    case "stance_progress":
+      log(`  立場判讀：${ev.done}/${ev.total} 則`, "dim"); break;
+
+    case "chart":                       // 後端數完了 → 這裡畫（LLM 不畫圖）
+      renderChart(turn.chart, ev); break;
+
     case "token":
       turn.text += ev.text;
       turn.answer.textContent = turn.text;
@@ -397,9 +534,12 @@ function handle(ev) {
     case "done":
       setLight(turn.light, ev.light === "green");
       renderSources(turn.sources, ev.sources);
+      // 圖通常已由 chart 事件畫好；沒畫到才補（例如事件掉了）。不重畫，免得閃一下。
+      if (ev.chart && turn.chart.style.display === "none") renderChart(turn.chart, ev.chart);
       chatHistory.push({ role: "user", content: turn.question });
       chatHistory.push({ role: "assistant", content: ev.answer });
-      turns.push({ q: turn.question, a: ev.answer, sources: ev.sources || [] });
+      turns.push({ q: turn.question, a: ev.answer, sources: ev.sources || [],
+                   chart: ev.chart || null });
       saveLocal();   // 後端這輪也已 persist_turn()；本機這份是匿名/DB 沒開時的備援
       setBusy(false);
       break;
