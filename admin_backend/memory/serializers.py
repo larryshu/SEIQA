@@ -20,6 +20,16 @@ class ConversationSerializer(serializers.ModelSerializer):
                   "created_at", "updated_at", "last_active_at", "expires_at", "is_deleted"]
 
 
+class ConversationExportSerializer(serializers.ModelSerializer):
+    """匯出：對話本體 + 完整訊息串（含每一輪的 sources 與 chart）。"""
+
+    messages = MessageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Conversation
+        fields = ["sid", "title", "messages"]
+
+
 class MemoryCollectionSerializer(serializers.ModelSerializer):
     class Meta:
         model = MemoryCollection

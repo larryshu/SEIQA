@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from accounts.models import AuditLog
+from accounts.models import AuditLog, EndUser
 from django.utils import timezone
 from testutils import RoleAPITestCase
 
@@ -124,6 +124,55 @@ class PaginationTests(RoleAPITestCase):
         resp = self.client.get(CONVERSATIONS_URL, {"page_size": 1000})
 
         self.assertEqual(len(resp.data["results"]), 60)  # 上限 200，這裡只有 60 筆全上
+
+
+class FilteringTests(RoleAPITestCase):
+    """?end_user= / ?search= / ?created_after= / ?ordering=（memory/filters.py）。"""
+
+    def setUp(self):
+        self.alice = EndUser.objects.create(username="alice")
+        now = timezone.now()
+        self.hers = make_conversation("s1", end_user=self.alice, message_count=10,
+                                      last_active_at=now)
+        self.hers.title = "遠距離戀愛可以維持嗎"
+        self.hers.save(update_fields=["title"])
+        self.anon = make_conversation("s2", message_count=2,
+                                      last_active_at=now - timedelta(hours=1))
+        self.as_role("viewer")
+
+    def _sids(self, params=None) -> list[str]:
+        resp = self.client.get(CONVERSATIONS_URL, params or {})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        return [row["sid"] for row in resp.data["results"]]
+
+    def test_filter_by_end_user(self):
+        self.assertEqual(self._sids({"end_user": self.alice.pk}), ["s1"])
+
+    def test_filter_anonymous_conversations(self):
+        """沒登入就發問的對話：end_user 是 NULL。"""
+        self.assertEqual(self._sids({"anonymous": "true"}), ["s2"])
+
+    def test_search_matches_title(self):
+        self.assertEqual(self._sids({"search": "遠距離"}), ["s1"])
+
+    def test_filter_by_created_after(self):
+        tomorrow = (timezone.now() + timedelta(days=1)).isoformat()
+
+        self.assertEqual(self._sids({"created_after": tomorrow}), [])
+
+    def test_ordering_can_be_overridden(self):
+        self.assertEqual(self._sids({"ordering": "message_count"}), ["s2", "s1"])
+        self.assertEqual(self._sids({"ordering": "-message_count"}), ["s1", "s2"])
+
+    def test_default_ordering_is_by_last_active(self):
+        """預設排序對齊 conv_list_idx——不指定 ordering 時要維持這個順序。"""
+        self.assertEqual(self._sids(), ["s1", "s2"])
+
+    def test_filters_do_not_resurrect_soft_deleted_conversations(self):
+        self.hers.is_deleted = True
+        self.hers.save(update_fields=["is_deleted"])
+
+        self.assertEqual(self._sids({"end_user": self.alice.pk}), [])
 
 
 class MessagesAndExportTests(RoleAPITestCase):

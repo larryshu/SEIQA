@@ -53,3 +53,23 @@ class EndUserLoginSerializer(serializers.Serializer):
 
     username = serializers.CharField(max_length=64)
     password = serializers.CharField(max_length=128, write_only=True)
+
+
+class EndUserAuthResponseSerializer(serializers.Serializer):
+    """註冊 / 登入成功的回應。實際拿來組回應，順便當成 OpenAPI 的 response schema。"""
+
+    end_user_id = serializers.IntegerField()
+    username = serializers.CharField()
+    display_name = serializers.CharField()
+    token = serializers.CharField(help_text="HS256 JWT，7 天效期；runtime 用同一把 TOKEN_SECRET 驗章")
+
+
+class OperatorMeSerializer(serializers.Serializer):
+    """GET /auth/me/ 的回應：目前登入的操作者與他的角色。"""
+
+    id = serializers.IntegerField()
+    username = serializers.CharField()
+    email = serializers.CharField()
+    is_superuser = serializers.BooleanField()
+    roles = serializers.ListField(child=serializers.CharField(),
+                                  help_text="admin / editor / viewer；superuser 自動視為 admin")

@@ -46,6 +46,8 @@ INSTALLED_APPS = [
     # 3rd party
     "rest_framework",
     "rest_framework_simplejwt.token_blacklist",
+    "django_filters",     # 對話列表的過濾 / 搜尋
+    "drf_spectacular",    # OpenAPI schema → /api/docs/
     # local apps（四模組）
     "accounts",
     "agents",
@@ -126,6 +128,49 @@ REST_FRAMEWORK = {
     ),
     # 400 的 body 同時帶 detail（給既有前端顯示）與 errors（欄位級）；見 config/exceptions.py
     "EXCEPTION_HANDLER": "config.exceptions.api_exception_handler",
+    # 過濾 / 搜尋 / 排序：掛成全域 backend，但只有宣告了 filterset_fields、search_fields、
+    # ordering_fields 的 viewset 才真的吃得到——沒宣告的等於沒掛，不會憑空多出查詢參數。
+    "DEFAULT_FILTER_BACKENDS": (
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
+    ),
+    # 限流：ScopedRateThrottle 只作用在有標 throttle_scope 的 view（見 accounts/views.py），
+    # 其餘端點不受影響。認證端點是唯一對外開放（AllowAny）的入口，不限流就等於開放暴力破解。
+    "DEFAULT_THROTTLE_CLASSES": (
+        "rest_framework.throttling.ScopedRateThrottle",
+    ),
+    "DEFAULT_THROTTLE_RATES": {
+        "end_auth_login": "5/min",      # 終端使用者登入：人打錯密碼不會一分鐘超過五次
+        "end_auth_register": "10/hour",  # 註冊本來就是稀有動作
+        "admin_login": "10/min",         # 後台操作者登入（JWT 簽發）
+    },
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+# 限流的計數存在 cache。預設 LocMemCache 是「每個 process 各一份」——開多個 worker 時
+# 實際額度會變成 N 倍。要真的擋住，正式環境應換成共用的 Redis：
+#   "BACKEND": "django.core.cache.backends.redis.RedisCache",
+#   "LOCATION": os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/1"),
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "seiqa-admin",
+    }
+}
+
+# OpenAPI 文件（/api/schema/、/api/docs/）。
+SPECTACULAR_SETTINGS = {
+    "TITLE": "社群輿情智能問答 — 後台 API",
+    "DESCRIPTION": "agent 設定 / 帳戶 / 記憶 / 偏好四模組。schema 由 code 自動產生，"
+                   "不會與實作脫節。權限模型見 accounts/permissions.py（viewer 讀、editor 寫、admin 全權）。",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,  # schema 端點自己不要出現在 schema 裡
+    "SCHEMA_PATH_PREFIX": "/api/v1",
+    # 一定要覆寫：drf-spectacular 的 SERVE_PERMISSIONS 預設是 AllowAny，會蓋掉上面全域的
+    # IsAuthenticated——照預設裝下去，整份 API 結構（含所有端點與欄位）是對外裸奔的。
+    # 改成沿用全域權限：登入 /admin/ 後靠 SessionAuthentication 就看得到。
+    "SERVE_PERMISSIONS": ["rest_framework.permissions.IsAuthenticated"],
 }
 
 SIMPLE_JWT = {

@@ -1,22 +1,25 @@
 """模組三 DRF viewsets（對應規格 §7.4）。
 
-conversation：列表/單筆/軟刪/messages/export/purge。
+conversation：列表/單筆/軟刪/messages/export/purge，可過濾、搜尋、排序。
 memory_collection：列表/單筆/sync（打 Qdrant 更新 metadata）。
 """
 from __future__ import annotations
 
 from django.db.models import Q
 from django.utils import timezone
-from rest_framework import mixins, viewsets
+from drf_spectacular.utils import extend_schema, inline_serializer
+from rest_framework import mixins, serializers, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from accounts.audit import AuditLogMixin
 from accounts.permissions import IsAdminRole, RoleBasedReadWrite
 
+from .filters import ConversationFilter
 from .models import Conversation, MemoryCollection
 from .pagination import ConversationPagination
 from .serializers import (
+    ConversationExportSerializer,
     ConversationSerializer,
     MemoryCollectionSerializer,
     MessageSerializer,
@@ -33,6 +36,13 @@ class ConversationViewSet(AuditLogMixin, mixins.ListModelMixin,
     pagination_class = ConversationPagination   # 只有對話列表分頁（每頁 50，?page=/?page_size=）
     audit_target_type = "conversation"
 
+    filterset_class = ConversationFilter  # ?end_user=3&created_after=2026-07-01
+    search_fields = ["sid", "title"]      # ?search=遠距離
+    ordering_fields = ["created_at", "last_active_at", "message_count"]
+    # 預設排序刻意對齊 conv_list_idx（is_deleted, -last_active_at, -created_at），沿索引取序。
+    # 使用者若自己指定 ?ordering=message_count 就離開索引、會 filesort——那是他要的取捨，不擋。
+    ordering = ["-last_active_at", "-created_at"]
+
     def get_queryset(self):
         # 列表不顯示已軟刪的對話（正確性 + 配 conv_list_idx 走索引）；
         # retrieve/export/messages 仍可存取單筆（含已軟刪，供清理前檢視）。
@@ -44,20 +54,24 @@ class ConversationViewSet(AuditLogMixin, mixins.ListModelMixin,
         instance.save(update_fields=["is_deleted"])
         self._write_audit("delete", instance.pk, {"soft": True})
 
+    @extend_schema(responses=MessageSerializer(many=True),
+                   summary="這段對話的所有訊息（含 sources 與 chart）")
     @action(detail=True, methods=["get"])
     def messages(self, request, pk=None):
         conv = self.get_object()
         return Response(MessageSerializer(conv.messages.all(), many=True).data)
 
+    @extend_schema(responses=ConversationExportSerializer, summary="匯出整段對話")
     @action(detail=True, methods=["get"])
     def export(self, request, pk=None):
         conv = self.get_object()
-        return Response({
-            "sid": conv.sid,
-            "title": conv.title,
-            "messages": MessageSerializer(conv.messages.all(), many=True).data,
-        })
+        return Response(ConversationExportSerializer(conv).data)
 
+    @extend_schema(
+        request=None,
+        responses=inline_serializer("PurgeResult", {"purged": serializers.IntegerField()}),
+        summary="硬刪已軟刪或已過期的對話（需 admin）",
+    )
     @action(detail=False, methods=["post"], permission_classes=[IsAdminRole])
     def purge(self, request):
         """硬刪『已軟刪』或『已過期(expires_at < now)』的對話。需 admin。"""
@@ -75,6 +89,12 @@ class MemoryCollectionViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
     serializer_class = MemoryCollectionSerializer
     permission_classes = [RoleBasedReadWrite]
 
+    @extend_schema(
+        request=None,
+        responses=MemoryCollectionSerializer,
+        summary="向 Qdrant 重抓這個 collection 的統計",
+        description="Qdrant 連不上時不會失敗，只把 status 標成 unknown（fail-safe）。",
+    )
     @action(detail=True, methods=["post"])
     def sync(self, request, pk=None):
         """打 Qdrant 更新 metadata（共用 memory.sync.sync_collection）。"""

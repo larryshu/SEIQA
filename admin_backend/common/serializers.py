@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 # 與 runtime 的 app/config_repo.py::_CASTERS 同一套轉型規則。
@@ -33,6 +35,9 @@ def as_item_list(data, wrapper_key: str):
     return data
 
 
+# 對 OpenAPI 明講「這裡什麼 JSON 型別都收」——它是刻意設計成如此的（見下方 docstring），
+# 不標的話 drf-spectacular 只能猜成 string，文件會騙人。
+@extend_schema_field(OpenApiTypes.ANY)
 class TypedValueField(serializers.Field):
     """設定值欄位：接受任何 JSON 型別，正規化成字串（DB 的 value 是 CharField）。
 

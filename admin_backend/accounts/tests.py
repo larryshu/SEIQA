@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import jwt
+from django.core.cache import cache
 from django.test import override_settings
 from rest_framework.test import APITestCase
 
@@ -16,12 +17,16 @@ from .models import EndUser
 REGISTER_URL = "/api/v1/end-auth/register/"
 LOGIN_URL = "/api/v1/end-auth/login/"
 ME_URL = "/api/v1/auth/me/"
+ADMIN_LOGIN_URL = "/api/v1/auth/login/"
 
 TEST_SECRET = "test-token-secret-at-least-32-bytes-long"  # 不依賴 .env，測試才能獨立跑
 
 
 @override_settings(TOKEN_SECRET=TEST_SECRET)
 class EndUserRegisterTests(APITestCase):
+    def setUp(self):
+        cache.clear()  # 限流計數存在 cache，且跨測試不會自動清——不清會互相污染
+
     def test_register_returns_201_with_usable_token(self):
         resp = self.client.post(REGISTER_URL, {"username": "alice", "password": "pw123456"},
                                 format="json")
@@ -88,6 +93,7 @@ class EndUserRegisterTests(APITestCase):
 @override_settings(TOKEN_SECRET=TEST_SECRET)
 class EndUserLoginTests(APITestCase):
     def setUp(self):
+        cache.clear()
         self.user = EndUser(username="alice", display_name="Alice", status="active")
         self.user.set_password("pw123456")
         self.user.save()
@@ -131,6 +137,61 @@ class EndUserLoginTests(APITestCase):
 
         self.assertEqual(resp.status_code, 400)
         self.assertIn("password", resp.data["errors"])
+
+
+class ThrottleTests(APITestCase):
+    """認證端點是全站唯一 AllowAny 的入口，沒限流就等於開放無限次猜密碼。
+
+    額度定義在 settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]：
+    end_auth_login 5/min、admin_login 10/min。這裡驗的是「猜錯也會被計數」——
+    只算成功次數的限流等於沒有限流。
+    """
+
+    def setUp(self):
+        cache.clear()
+        user = EndUser(username="alice", status="active")
+        user.set_password("pw123456")
+        user.save()
+
+    def _guess(self):
+        return self.client.post(LOGIN_URL, {"username": "alice", "password": "wrong"},
+                                format="json")
+
+    def test_failed_logins_are_counted_and_then_blocked(self):
+        for attempt in range(5):  # end_auth_login 額度是 5/min
+            self.assertEqual(self._guess().status_code, 401, f"第 {attempt + 1} 次應該還過得去")
+
+        blocked = self._guess()
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertIn("Retry-After", blocked.headers)  # 告訴對方多久以後再來
+
+    def test_throttle_also_blocks_the_correct_password(self):
+        """額度用完後，連正確密碼都進不來——不然攻擊者只要猜對就繞過了限流。"""
+        for _ in range(5):
+            self._guess()
+
+        resp = self.client.post(LOGIN_URL, {"username": "alice", "password": "pw123456"},
+                                format="json")
+
+        self.assertEqual(resp.status_code, 429)
+
+    def test_admin_login_is_throttled_too(self):
+        """SimpleJWT 原生的 TokenObtainPairView 沒有限流；這支後面是 admin 權限，更該保護。"""
+        payload = {"username": "operator", "password": "wrong"}
+        for _ in range(10):  # admin_login 額度是 10/min
+            self.client.post(ADMIN_LOGIN_URL, payload, format="json")
+
+        blocked = self.client.post(ADMIN_LOGIN_URL, payload, format="json")
+
+        self.assertEqual(blocked.status_code, 429)
+
+    def test_unthrottled_endpoints_are_unaffected(self):
+        """ScopedRateThrottle 只作用在標了 throttle_scope 的 view，其餘端點不該被波及。"""
+        for _ in range(6):
+            resp = self.client.get(ME_URL)  # 沒帶身分 → 401，但不該變成 429
+
+        self.assertEqual(resp.status_code, 401)
 
 
 class MeViewTests(RoleAPITestCase):

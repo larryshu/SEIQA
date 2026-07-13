@@ -1,16 +1,17 @@
 """模組二路由：JWT 認證端點（對應規格 §7.1）。"""
 from django.urls import path
-from rest_framework_simplejwt.views import (
-    TokenBlacklistView,
-    TokenObtainPairView,
-    TokenRefreshView,
-)
+from rest_framework_simplejwt.views import TokenBlacklistView, TokenRefreshView
 
-from .views import EndUserLoginView, EndUserRegisterView, MeView
+from .views import (
+    EndUserLoginView,
+    EndUserRegisterView,
+    MeView,
+    ThrottledTokenObtainPairView,
+)
 
 urlpatterns = [
     # 操作者（後台）認證
-    path("auth/login/", TokenObtainPairView.as_view(), name="auth-login"),
+    path("auth/login/", ThrottledTokenObtainPairView.as_view(), name="auth-login"),
     path("auth/refresh/", TokenRefreshView.as_view(), name="auth-refresh"),
     path("auth/logout/", TokenBlacklistView.as_view(), name="auth-logout"),
     path("auth/me/", MeView.as_view(), name="auth-me"),
