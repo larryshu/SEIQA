@@ -102,11 +102,16 @@
 | 套件 | 用途 |
 |------|------|
 | `Django==5.1.15` | ORM、Admin、migration |
-| `djangorestframework` | ViewSet / Router / Serializer / Permission |
+| `djangorestframework` | ViewSet / Router / Serializer / Permission / Throttle / ExceptionHandler |
 | `djangorestframework-simplejwt` | **操作者**（後台管理員）的 JWT：access 60 分、refresh 7 天、rotate + blacklist |
+| `django-filter==25.1` | 對話列表的過濾／搜尋（26.x 起要求 Django 5.2，故釘 25.1） |
+| `drf-spectacular` | 由 code 產生 OpenAPI schema → Swagger UI（`/api/docs/`） |
 | `mysqlclient` | MySQL driver |
 
 > 兩個 venv 刻意分開（`.venv` / `.venv-admin`）：runtime 不需要 Django，後台不需要爬蟲相依。
+>
+> ⚠️ **`.venv-admin/Scripts/pip.exe` 裡寫死的路徑指向別的專案**（這個 venv 是複製來的），直接呼叫它會把套件裝到別處。
+> 一律用 **`.venv-admin\Scripts\python.exe -m pip install ...`**——跟著直譯器走，不會裝錯環境。
 
 ---
 
@@ -622,12 +627,13 @@ WHERE sid=%s AND end_user_id=%s AND is_deleted=0
 
 | 模組 | 端點 | 說明 |
 |------|------|------|
-| 認證 | `POST auth/login/`、`auth/refresh/`、`auth/logout/`、`GET auth/me/` | 操作者 JWT（simplejwt；logout = blacklist refresh token） |
-| 認證 | `POST end-auth/register/`、`POST end-auth/login/` | **終端使用者**（公開），成功回自簽的 7 天 JWT |
+| 認證 | `POST auth/login/`（**限流 10/min**）、`auth/refresh/`、`auth/logout/`、`GET auth/me/` | 操作者 JWT（simplejwt；logout = blacklist refresh token）。login 另包一層 `ThrottledTokenObtainPairView`——SimpleJWT 原生的 view 沒有限流，而它後面是 admin 權限 |
+| 認證 | `POST end-auth/register/`（**10/hour**）、`POST end-auth/login/`（**5/min**） | **終端使用者**（公開），成功回自簽的 7 天 JWT。額度以失敗次數一併計算，用完後連正確密碼也會被擋 |
+| 文件 | `GET /api/schema/`、`GET /api/docs/` | OpenAPI 3 + Swagger UI（drf-spectacular），schema 由 code 產生。**需登入**——套件預設是 `AllowAny`，會讓整份 API 結構裸奔，已覆寫 |
 | 模組一 | `/agents/`（CRUD）<br>`POST /agents/{id}/activate/`<br>`POST /agents/{id}/test-run/` | agent 人設/模型/參數；activate 用 transaction 保證**全系統只有一個 is_active**；test-run 目前回 501（樁） |
 | 模組一 | `/skills/`（CRUD） | function-calling 定義（name / description / json_schema） |
 | 模組一 | `/source-platforms/`（CRUD）<br>`GET,PUT /source-platforms/{id}/configs/` | 來源平台啟用/排序；configs 以 key upsert（top_k / min_score / time_budget…） |
-| 模組三 | `GET /conversations/`（分頁 50）<br>`GET /conversations/{id}/messages/`<br>`GET /conversations/{id}/export/`<br>`DELETE /conversations/{id}/`（軟刪）<br>`POST /conversations/purge/`（**admin**，硬刪已軟刪或已過期） | 對話檢視/匯出/清理 |
+| 模組三 | `GET /conversations/`（分頁 50；可 `?end_user=`／`?search=`／`?created_after=`／`?anonymous=`／`?ordering=`）<br>`GET /conversations/{id}/messages/`<br>`GET /conversations/{id}/export/`<br>`DELETE /conversations/{id}/`（軟刪）<br>`POST /conversations/purge/`（**admin**，硬刪已軟刪或已過期） | 對話檢視/匯出/清理。預設排序維持 `-last_active_at,-created_at` 以對齊 `conv_list_idx`；自訂 `ordering` 會離開索引走 filesort |
 | 模組三 | `/memory-collections/`、`POST /{id}/sync/` | 打 Qdrant 更新 collection metadata（point_count / vector_size / status） |
 | 模組四 | `/system-settings/`（CRUD，`lookup_field="key"`） | 全域設定 |
 | 模組四 | `GET,PUT /end-users/{id}/preferences/` | 每使用者偏好（人工設定 → `source='manual'`） |

@@ -6,8 +6,8 @@
 | 項目 | 內容 |
 |---|---|
 | 定位 | tool-calling 的**多平台社群口碑問答 Agent** + 可設定化後台 |
-| 技術棧 | 前台 runtime：FastAPI · WebSocket · PyMySQL · PyJWT · DrissionPage（Dcard 反爬即時爬）· Qdrant · Azure OpenAI；後台：Django 5 · DRF · MySQL 8；前端：Streamlit（阻塞問答）＋ WebSocket demo 頁（即時進度 / 逐字串流 / 中途取消 / 立場分佈圖） |
-| 狀態 | M0–M6 + 終端登入 + 使用者長期記憶/登出 + 偏好自動推論 + WebSocket 即時前端 + 立場統計與圖表 **皆已實作（as-built）** |
+| 技術棧 | 前台 runtime：FastAPI · WebSocket · PyMySQL · PyJWT · DrissionPage（Dcard 反爬即時爬）· Qdrant · Azure OpenAI；後台：Django 5 · DRF · MySQL 8 · django-filter · drf-spectacular；前端：Streamlit（阻塞問答）＋ WebSocket demo 頁（即時進度 / 逐字串流 / 中途取消 / 立場分佈圖） |
+| 狀態 | M0–M6 + 終端登入 + 使用者長期記憶/登出 + 偏好自動推論 + WebSocket 即時前端 + 立場統計與圖表 + 後台工程化（77 測試 / 限流 / OpenAPI）**皆已實作（as-built）** |
 
 ---
 
@@ -45,8 +45,9 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 - **全域 fail-safe（分層）**：Dcard 即時爬掛了退向量庫、PTT 掛了只少 PTT、任一來源 embed/Qdrant/後台 DB 出事只降級不中斷；兩邊都空 → 誠實退回常識（🟡 黃燈），反幻覺。
 - **WebSocket 即時前端**：`/ws/ask` 把 agent 的每一步（抽關鍵字、深挖第幾篇、**退回 fallback**）即時推給前端、答案逐字串流，並支援生成中取消。事件匯流排用 `contextvars` 實作，**`/ask` 與 Streamlit 行為完全不變**（見 [§3.3](#33-即時進度串流與取消websocketwsask)）。
 - **三層記憶（長期層雙軌）+ 偏好自動推論**：短期檢索快取、中期對話落地、長期使用者記憶（**事實點狀召回 ＋ 脈絡敘事重載 / episodic 雙軌**）；登出時 LLM 另從對話**自動學習可執行偏好**（白名單 + 保守門檻 + 不覆寫人工設定）。
-- **完整後台**：四模組（agent / 帳戶 / 記憶 / 偏好）、RBAC（admin/editor/viewer）、稽核、JWT 雙身分（操作者 vs 終端使用者）。
+- **完整後台**：四模組（agent / 帳戶 / 記憶 / 偏好）、RBAC（admin/editor/viewer）、稽核、JWT 雙身分（操作者 vs 終端使用者）；認證端點限流、輸入一律走 serializer 驗證、`/api/docs/` 有由 code 產生的 Swagger。
 - **SQL 優化實績**：N+1 修正（31→2、21→2 查詢）、複合索引消除 filesort、對話列表分頁對齊索引。
+- **測試護欄（77 條）**：`python manage.py test` 跑在真的 MySQL 上。其中 **N+1 迴歸測試不寫死查詢次數**，而是斷言「查詢數不隨資料筆數成長」——拿掉 `prefetch_related` 就會紅。**「修好了」是成果，「不會再壞」才是護欄。**
 
 ---
 
@@ -310,8 +311,12 @@ erDiagram
 - **四模組 CRUD（as-built）**：
   - Agent：`/agents/`（+`activate`；`test-run` 目前回 501 樁）、`/skills/`、`/source-platforms/`（+`configs`）
   - 帳戶：`/auth/*`（操作者 JWT：login / refresh / logout / me）、`/end-auth/{register,login}/`（終端使用者）
-  - 記憶：`/conversations/`（列表分頁、`messages`、`export`、`purge`）、`/memory-collections/`（+`sync`）
+  - 記憶：`/conversations/`（分頁 + 過濾/搜尋/排序、`messages`、`export`、`purge`）、`/memory-collections/`（+`sync`）
   - 偏好：`/system-settings/`、`/end-users/{id}/preferences/`
+- **📖 API 文件**：`http://localhost:8000/api/docs/`（Swagger UI）／`/api/schema/`（OpenAPI 3 YAML）。schema 由 code 產生，**`spectacular --fail-on-warn` 零警告本身就是一條測試**，文件不會與實作脫節。（需登入——drf-spectacular 預設是 `AllowAny`，會讓整份 API 結構裸奔，已覆寫成 `IsAuthenticated`。）
+- **🔒 限流**：認證端點是全站唯一 `AllowAny` 的入口，一律套 `ScopedRateThrottle`——`end-auth/login` 5/min、`end-auth/register` 10/hour、後台 `auth/login` 10/min（SimpleJWT 原生的 `TokenObtainPairView` **沒有**限流，另包一層補上）。額度以失敗次數計算，用完後連正確密碼也擋。
+- **✅ 輸入驗證**：所有寫入端點的輸入都走 serializer，不在 view 裡直接讀 `request.data`——少送欄位回結構化的 **400**（含 `detail` 與欄位級 `errors`），不是 `KeyError` 變成 500。
+- **🔎 對話列表查詢**：`?end_user=3`、`?search=遠距離`、`?created_after=2026-07-01`、`?anonymous=true`、`?ordering=-message_count`。預設排序維持 `-last_active_at,-created_at` 以**對齊 `conv_list_idx`**；自訂 `ordering` 會離開索引走 filesort（是使用者要的取捨，不擋）。
 
 > ⚠️ **spec §7.3 與實作的落差**：規格列的帳戶管理 REST API（`/operators/`、`/roles/`、`/end-users/` CRUD、`/api-keys/`、`/audit-logs/`）**尚未實作成 DRF endpoint**。這些管理動作目前一律走 **Django Admin**（`accounts/admin.py` 已註冊 `EndUser` / `ApiKey` / `AuditLog`，含批次動作），符合 spec §14 決議四「後台前端先用 Django Admin 過渡」。`accounts` 的 DRF 路由**只有**認證那兩組。
 
@@ -401,10 +406,14 @@ uvicorn app.api:app --reload --port 8001
 
 ```powershell
 python -m venv .venv-admin
-.venv-admin\Scripts\pip install -r requirements-admin.txt
+.venv-admin\Scripts\python.exe -m pip install -r requirements-admin.txt
 .venv-admin\Scripts\python admin_backend\manage.py migrate
 .\start.ps1                        # Django 8000 + FastAPI 8001 + Streamlit 8501，並自動開 /demo
 ```
+
+> ⚠️ **裝套件請用 `python.exe -m pip`，不要直接叫 `.venv-admin\Scripts\pip.exe`**。
+> 那顆 `pip.exe` 裡寫死的路徑指向**別的專案**（這個 venv 是複製來的），直接呼叫會把套件裝到別處去，
+> 而 `python -m pip` 跟著當下的直譯器走，不會裝錯環境。
 
 **兩個前端**：
 
@@ -413,7 +422,25 @@ python -m venv .venv-admin
 | WebSocket demo（`start.ps1` 自動開） | http://localhost:8001/demo | agent 即時進度、逐字串流、**中途可停止**、來源依平台分組收合、**立場分佈圓餅圖**（問「正反幾成」時）、**F5／換裝置可還原對話**（登入者從 MySQL 讀回） |
 | Streamlit | http://localhost:8501 | 阻塞問答（送出後等完整答案），需手動開啟；F5 從伺服器磁碟 `.sessions/` 讀回 |
 
-**測試**：Swagger UI（http://localhost:8001/docs，注意 WebSocket 不會出現在 OpenAPI）／ curl `POST /ask` ／ 兩個前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則」或「🟡 LLM 既有常識」。兩來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET)` 秒（非相加）——這也正是 `/demo` 要即時推進度的原因。
+**後台 API 文件**：http://localhost:8000/api/docs/（Swagger UI，需先登入 `/admin/`）。
+
+### 7.1 跑測試
+
+```powershell
+.venv-admin\Scripts\python.exe admin_backend\manage.py test
+```
+
+77 條，跑在真的 MySQL 上（會自動建 `test_<DB_NAME>` 再銷毀，不碰正式資料）。約 2 分鐘。
+只跑某一組：
+
+```powershell
+# N+1 迴歸（把 views.py 的 prefetch_related 拿掉，這兩條就會紅）
+.venv-admin\Scripts\python.exe admin_backend\manage.py test agents.tests.QueryCountRegressionTests
+# 登入限流
+.venv-admin\Scripts\python.exe admin_backend\manage.py test accounts.tests.ThrottleTests
+```
+
+**手動驗證 runtime**：Swagger UI（http://localhost:8001/docs，注意 WebSocket 不會出現在 OpenAPI）／ curl `POST /ask` ／ 兩個前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則」或「🟡 LLM 既有常識」。兩來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET)` 秒（非相加）——這也正是 `/demo` 要即時推進度的原因。
 
 ---
 
@@ -484,10 +511,16 @@ agent / tools / prompt 都不用動——這就是 registry 的用意。
 | 追加 | **WebSocket 即時前端**：`progress.py` 事件匯流排、`/ws/ask` 逐字串流、中途取消、`/demo` 頁與登入代理 |
 | 追加 | **對話還原**：`GET /me`、`GET /conversation/{sid}`、`GET /conversations`（`memory_store.load_history`）；`/demo` 頁 sid 進網址 + `localStorage` 備份 → F5／換裝置接得回上下文（落地的 `message` 表從此不再是唯寫） |
 | 追加 | **立場統計與圖表**：第二個 skill `stance_breakdown`（`app/stance.py`）——LLM 逐則分類、Python `Counter` 加總、前端手刻 SVG 圓餅；`MAX_TOOL_ROUNDS` 1→2 + `tool_choice="none"` 收尾；`store.all()` 讓追問不重爬 |
+| 追加 | **後台工程化**：77 條 DRF 測試（含 N+1 迴歸）、輸入一律走 serializer 驗證 + 自訂 `EXCEPTION_HANDLER`、認證端點 `ScopedRateThrottle` 限流、對話列表過濾/搜尋/排序（django-filter）、`/api/docs/` OpenAPI（drf-spectacular）|
 
 > ✅ **as-built**：M0–M6 與個人化記憶／偏好推論皆通過真實 LLM 端到端驗證（後台改 prompt→reload→回答變、`community_search` 雙來源、對話落地、登入後偏好過濾平台 + 對話歸戶、登出摘要與偏好推論）。
 >
 > ✅ **WebSocket 路徑**：事件流、逐字串流、取消（0.16s 內收到 `cancelled`）、同連線多輪、登入代理與 `/ask` 不回歸，皆以自動化測試對真實 uvicorn 驗證過（agent 以 stub 替換）。
+> ⚠️ 但那批是**臨時腳本、沒有留在 repo 裡**——`app/` 目前沒有任何 committed 的測試檔。要重跑得重寫。
+>
+> ✅ **後台測試（留在 repo）**：`admin_backend/` 有 **77 條 DRF `APITestCase`**（`python manage.py test`，跑在真的 MySQL 上）：
+> RBAC 矩陣、稽核、軟刪 vs purge、分頁與過濾、輸入驗證、登入限流、OpenAPI schema 零警告，
+> 以及兩條 **N+1 迴歸測試**（斷言「查詢數不隨資料筆數成長」，拿掉 `prefetch_related` 就會紅）。
 >
 > ✅ **`chat_with_tools_stream()` 已對真實 Azure OpenAI 驗證**（`stream=True` + tools）：常識題正確不呼叫工具並逐字串流；需查題在串流中組出 `community_search` 的 tool_call，分片累積出的 `arguments` 為合法 JSON。長答案實測 305 片 token 於 1.67s 內陸續到達（確為串流、非一次回傳）。備註：此端點首片延遲約 7s（模型/gateway 起始等待，非程式問題）——正好凸顯進度推播的價值。
 
