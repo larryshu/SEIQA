@@ -8,12 +8,14 @@ from rest_framework.response import Response
 
 from accounts.audit import AuditLogMixin
 from accounts.permissions import RoleBasedReadWrite
+from common.serializers import as_item_list
 
 from .models import Agent, Skill, SourceConfig, SourcePlatform
 from .serializers import (
     AgentSerializer,
     SkillSerializer,
     SourceConfigSerializer,
+    SourceConfigUpsertSerializer,
     SourcePlatformSerializer,
 )
 
@@ -68,14 +70,18 @@ class SourcePlatformViewSet(AuditLogMixin, viewsets.ModelViewSet):
         if request.method == "GET":
             ser = SourceConfigSerializer(platform.configs.all(), many=True)
             return Response(ser.data)
-        # PUT：[{key,value,value_type}, ...]
-        items = request.data if isinstance(request.data, list) else request.data.get("configs", [])
+        # PUT：[{key,value,value_type}, ...]（也接受 {"configs": [...]}）
+        # 先過 serializer：缺 key、value 對不起 value_type、value 過長 → 400，
+        # 而不是在迴圈裡 item["key"] 撞 KeyError 變成 500。
+        payload = SourceConfigUpsertSerializer(
+            data=as_item_list(request.data, "configs"), many=True)
+        payload.is_valid(raise_exception=True)
+        items = payload.validated_data
         with transaction.atomic():
             for item in items:
                 SourceConfig.objects.update_or_create(
                     platform=platform, key=item["key"],
-                    defaults={"value": str(item.get("value", "")),
-                              "value_type": item.get("value_type", "str")},
+                    defaults={"value": item["value"], "value_type": item["value_type"]},
                 )
         self._write_audit("update", platform.pk, {"configs": items})
         ser = SourceConfigSerializer(platform.configs.all(), many=True)

@@ -11,6 +11,7 @@ from rest_framework.views import APIView
 
 from .models import EndUser
 from .permissions import roles_of
+from .serializers import EndUserLoginSerializer, EndUserRegisterSerializer
 
 
 def issue_end_user_token(end_user) -> str:
@@ -45,18 +46,9 @@ class EndUserRegisterView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        username = (request.data.get("username") or "").strip()
-        password = request.data.get("password") or ""
-        if not username or not password:
-            return Response({"detail": "username 與 password 必填"}, status=400)
-        if EndUser.objects.filter(username=username).exists():
-            return Response({"detail": "此帳號已存在"}, status=400)
-        u = EndUser(username=username,
-                    display_name=(request.data.get("display_name") or username),
-                    email=(request.data.get("email") or None),
-                    auth_provider="local", status="active")
-        u.set_password(password)
-        u.save()
+        ser = EndUserRegisterSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)  # 缺欄位 / 帳號重複 → 400（含 detail 與欄位級 errors）
+        u = ser.save()
         return Response({"end_user_id": u.id, "username": u.username,
                          "display_name": u.display_name, "token": issue_end_user_token(u)},
                         status=201)
@@ -68,8 +60,10 @@ class EndUserLoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        username = (request.data.get("username") or "").strip()
-        password = request.data.get("password") or ""
+        ser = EndUserLoginSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)  # 沒填 → 400；帳密錯 → 下面回 401（兩者要分得開）
+        username = ser.validated_data["username"]
+        password = ser.validated_data["password"]
         try:
             u = EndUser.objects.get(username=username)
         except EndUser.DoesNotExist:

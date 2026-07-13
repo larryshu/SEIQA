@@ -124,6 +124,8 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
     ),
+    # 400 的 body 同時帶 detail（給既有前端顯示）與 errors（欄位級）；見 config/exceptions.py
+    "EXCEPTION_HANDLER": "config.exceptions.api_exception_handler",
 }
 
 SIMPLE_JWT = {

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from common.serializers import TypedKeyValueSerializer, TypedValueField
+
 from .models import Agent, Skill, SourceConfig, SourcePlatform
 
 
@@ -46,9 +48,17 @@ class AgentSerializer(serializers.ModelSerializer):
 
 
 class SourceConfigSerializer(serializers.ModelSerializer):
+    """輸出用（GET / 巢狀在平台底下）。"""
+
     class Meta:
         model = SourceConfig
         fields = ["id", "key", "value", "value_type"]
+
+
+class SourceConfigUpsertSerializer(TypedKeyValueSerializer):
+    """輸入用：PUT /source-platforms/{id}/configs/ 的單筆。value 對齊 SourceConfig.value 的 255。"""
+
+    value = TypedValueField(max_length=255)
 
 
 class SourcePlatformSerializer(serializers.ModelSerializer):
