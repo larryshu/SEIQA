@@ -34,8 +34,13 @@ def _connect():
 
 def persist_turn(session_id: str, user_message: str, answer: str,
                  used_tools: list | None = None, sources: list | None = None,
-                 agent_id: int | None = None, end_user_id: int | None = None) -> None:
-    """寫入一輪對話：依 sid 找/建 conversation → 插入 user + assistant 兩則訊息。"""
+                 agent_id: int | None = None, end_user_id: int | None = None,
+                 chart: dict | None = None) -> None:
+    """寫入一輪對話：依 sid 找/建 conversation → 插入 user + assistant 兩則訊息。
+
+    chart：stance_breakdown 的統計結果，跟 sources 一樣是「答案的一部分」——
+    不落地的話，使用者 F5 後文字回得來、圖卻不見了。
+    """
     if not _enabled():
         return
     now = datetime.utcnow()  # 與 Django USE_TZ 的 UTC 儲存一致
@@ -61,16 +66,20 @@ def persist_turn(session_id: str, user_message: str, answer: str,
                 )
                 conv_id = cur.lastrowid
             cur.execute(
-                "INSERT INTO message (conversation_id, role, content, used_tools, sources, created_at) "
-                "VALUES (%s,'user',%s,NULL,NULL,%s)",
+                "INSERT INTO message "
+                "(conversation_id, role, content, used_tools, sources, chart, created_at) "
+                "VALUES (%s,'user',%s,NULL,NULL,NULL,%s)",
                 (conv_id, user_message or "", now),
             )
             cur.execute(
-                "INSERT INTO message (conversation_id, role, content, used_tools, sources, created_at) "
-                "VALUES (%s,'assistant',%s,%s,%s,%s)",
+                "INSERT INTO message "
+                "(conversation_id, role, content, used_tools, sources, chart, created_at) "
+                "VALUES (%s,'assistant',%s,%s,%s,%s,%s)",
                 (conv_id, answer or "",
                  json.dumps(used_tools or [], ensure_ascii=False),
-                 json.dumps(sources or [], ensure_ascii=False), now),
+                 json.dumps(sources or [], ensure_ascii=False),
+                 json.dumps(chart, ensure_ascii=False) if chart else None,  # 沒統計就是 NULL
+                 now),
             )
         conn.commit()
     except Exception as e:  # noqa: BLE001 — 落地失敗絕不可中斷聊天
@@ -88,7 +97,8 @@ def load_history(session_id: str, end_user_id: int | None, limit: int = 200) -> 
 
     只鎖 sid + end_user_id + is_deleted=0：知道別人的 sid 也讀不到別人的對話，
     登出時軟刪掉的對話也不會被還原。用 crawl_rw 現有的 SELECT 權限即可。
-    回 [{role, content, sources}]（依時間排序），任何失敗都回 [] —— 還原是加值功能，不該擋住聊天。
+    回 [{role, content, sources, chart}]（依時間排序），任何失敗都回 [] ——
+    還原是加值功能，不該擋住聊天。chart 一起讀回來，否則 F5 之後圖會消失（見 persist_turn）。
     """
     if not _enabled() or not session_id or not end_user_id:
         return []
@@ -97,7 +107,7 @@ def load_history(session_id: str, end_user_id: int | None, limit: int = 200) -> 
         conn = _connect()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT m.role, m.content, m.sources FROM message m "
+                "SELECT m.role, m.content, m.sources, m.chart FROM message m "
                 "JOIN conversation c ON m.conversation_id = c.id "
                 "WHERE c.sid=%s AND c.end_user_id=%s AND c.is_deleted=0 "
                 "ORDER BY m.created_at, m.id LIMIT %s",
@@ -105,8 +115,9 @@ def load_history(session_id: str, end_user_id: int | None, limit: int = 200) -> 
             )
             rows = cur.fetchall()
         return [
-            {"role": role, "content": content or "", "sources": _loads(sources)}
-            for role, content, sources in rows
+            {"role": role, "content": content or "", "sources": _loads(sources),
+             "chart": _loads_obj(chart)}
+            for role, content, sources, chart in rows
             if role in ("user", "assistant")
         ]
     except Exception as e:  # noqa: BLE001 — 讀不回來就當沒有歷史，前端照樣能開新對話
@@ -162,6 +173,19 @@ def _loads(raw) -> list:
     except (ValueError, TypeError):
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _loads_obj(raw) -> dict | None:
+    """message.chart 同理，但它是物件（沒統計時為 NULL）。壞資料一律當沒有。"""
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def soft_delete_conversation(session_id: str, end_user_id: int | None) -> int:

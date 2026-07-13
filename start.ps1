@@ -46,10 +46,42 @@ try {
     & $rt -m streamlit run --server.headless true (Join-Path $root "ui\streamlit_app.py")
 }
 finally {
+    # 1) 先請 runtime 自己乾淨地收掉 Dcard 的 Chrome。
+    #    不能只靠 app 的 atexit / lifespan：下面是 taskkill /F（硬殺），被硬殺的行程沒有機會收尾，
+    #    而 Windows 不會連帶帶走子行程 —— 那顆 Chrome 就會變成孤兒繼續佔著記憶體。
+    #    正常 quit 還能讓 Chrome 把 profile（含 cf_clearance）寫回磁碟，下次比較容易直接過盾。
+    Write-Host "收掉 Dcard 瀏覽器..." -ForegroundColor Yellow
+    try {
+        Invoke-WebRequest "http://127.0.0.1:8001/internal/close-browser" -Method Post `
+            -TimeoutSec 5 -UseBasicParsing | Out-Null
+        Start-Sleep -Milliseconds 800   # 給 Chrome 幾百毫秒把自己收乾淨
+    } catch {
+        Write-Host "  (runtime 沒回應，略過；改由下面的孤兒清理處理)" -ForegroundColor DarkGray
+    }
+
     Write-Host "關閉後端服務 (Django / FastAPI)..." -ForegroundColor Yellow
     foreach ($p in @($api, $django)) {
         if ($p -and -not $p.HasExited) {
             taskkill /PID $p.Id /T /F | Out-Null  # 連同 reload 子行程一起關
+        }
+    }
+
+    # 2) 清掉孤兒 Chrome：--reload 每殺一次舊 worker，就會留下一顆父行程已死的 Chrome，
+    #    它早已脫離上面那棵行程樹，taskkill /T 看不到它。用「指令列含我們的 profile 路徑」認人，
+    #    所以只會殺到本專案開的那些，不會動到你自己在用的 Chrome。
+    $profileDir = $null
+    $envFile = Join-Path $root ".env"
+    if (Test-Path $envFile) {
+        $line = Select-String -Path $envFile -Pattern '^\s*DCARD_USER_DATA_DIR\s*=\s*(.+)$' |
+                Select-Object -First 1
+        if ($line) { $profileDir = $line.Matches[0].Groups[1].Value.Trim().Trim('"') }
+    }
+    if ($profileDir) {
+        $orphans = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+                   Where-Object { $_.CommandLine -and $_.CommandLine -like "*$profileDir*" }
+        if ($orphans) {
+            Write-Host "清理殘留的 Dcard 瀏覽器行程 ($($orphans.Count) 個)..." -ForegroundColor Yellow
+            $orphans | ForEach-Object { taskkill /PID $_.ProcessId /T /F 2>$null | Out-Null }
         }
     }
 }

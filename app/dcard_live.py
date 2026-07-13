@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import random
@@ -336,6 +337,28 @@ def _reset_crawler() -> None:
         except Exception:  # noqa: BLE001
             pass
         _singleton = None
+
+
+def shutdown() -> None:
+    """行程要結束了 → 收掉那顆 Chrome。
+
+    平常「爬完不關」是刻意的：單例保溫，過一次 Cloudflare 就重用那個 session（關掉再開
+    等於每題重過一次互動盾，慢且更容易被盯上）。但**沒有人在行程結束時收尾**——Chrome 是
+    DrissionPage 啟動的獨立子行程，uvicorn 死了它不會跟著死，每次重啟就多留一顆孤兒
+    （`--reload` 存一次檔就堆一顆，因為 auto_port 每次挑新埠、不會接管既有那顆）。
+
+    正常 quit() 還有一個好處：Chrome 會把 profile（含 cf_clearance）好好寫回磁碟，
+    下次啟動反而更容易直接過盾——被硬殺的 Chrome 可能來不及 flush。
+    """
+    if _singleton is None:
+        return
+    log.info("關機：收掉 Dcard 瀏覽器")
+    _reset_crawler()
+
+
+# 保險絲：正常退出（Ctrl+C、uvicorn 收工）時一定收掉；沒開過瀏覽器就是 no-op。
+# 註：硬殺（kill -9 / 工作管理員結束處理程序）救不了，那是必然的。
+atexit.register(shutdown)
 
 
 # --- 關鍵字抽取（LLM）------------------------------------------------------

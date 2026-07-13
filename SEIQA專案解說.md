@@ -334,6 +334,14 @@ finally:
 **fail-safe**：任一批分類失敗只少那一批；全部分不出來 → 回 `None`，工具告訴 LLM「照常用文字回答，不要自己估比例、不要畫圖」。
 統計結果一路帶回 `/ask` 的 `chart` 欄位與 WebSocket 的 `done` 事件，**兩個前端都拿得到**，不是只有 WebSocket 那條。
 
+**圖會落地、也還原得回來**：`chart` 跟 `sources` 一樣是「答案的一部分」——`message` 表有 `chart` JSON 欄（migration `memory/0003`），
+`persist_turn()` 寫、`load_history()` 讀、`GET /conversation/{sid}` 帶回。少了這條路，使用者 F5 之後文字回得來、圖卻不見了。
+
+> **踩到的坑：MySQL 的 JSON 欄位會重排物件的 key。** 寫進去 `{贊成:12, 反對:6, 中立:3}`，讀回來變成
+> `{中立:3, 反對:6, 贊成:12}`（原生 JSON 型別會正規化 key 順序）。內容沒錯，但前端原本是照 `counts` 的
+> key 順序畫圓餅、並用**索引**去取自訂分類軸的顏色——還原出來的那張圖切片順序、配色就跟原本不一樣了。
+> 解法：一律以 `categories`（JSON **陣列**，保序）當唯一的順序來源。**JSON 陣列保序、JSON 物件不保序。**
+
 ---
 
 ## 5. WebSocket 即時問答（`WS /ws/ask`）
@@ -466,7 +474,7 @@ messages.append({"role": "user", "content": user_message})
 把落地在 `message` 表的內容讀回來重建 `history`。三個必要條件都寫在 SQL 裡：
 
 ```sql
-SELECT m.role, m.content, m.sources FROM message m
+SELECT m.role, m.content, m.sources, m.chart FROM message m   -- chart：那一輪的立場分佈圖（§4.7）
 JOIN conversation c ON m.conversation_id = c.id
 WHERE c.sid=%s AND c.end_user_id=%s AND c.is_deleted=0   -- 綁身分、且不還原已軟刪的對話
 ORDER BY m.created_at, m.id LIMIT %s
@@ -686,7 +694,7 @@ DRF 那側也處理了 N+1：`prefetch_related("skills")` / `prefetch_related("c
 | 逐字串流 | `WS /ws/ask` | `app/api.py`、`app/progress.py`、`llm.chat_with_tools_stream()` | worker thread 跑阻塞 agent → `contextvars` 匯流排 `emit()` → `call_soon_threadsafe` 進 asyncio queue → `ws.send_json()` |
 | 中途取消 | `{"type":"cancel"}` | `app/progress.py` | `threading.Event` + 各層檢查點；`Cancelled(BaseException)` 穿過所有 `except Exception` 的 fail-safe 網 |
 | 對話落地 | （內部）MySQL `crawl_rw` | `app/memory_store.py` | 依 sid 找/建 conversation → 插 user + assistant 兩則 message（含 used_tools / sources JSON）→ 失敗只 log |
-| 對話還原 | `GET /me`、`GET /conversation/{sid}`、`GET /conversations` | `app/memory_store.py::load_history()` / `list_conversations()` | 前端開場：驗 token → 讀回這段對話重建 `history` 與畫面（含來源清單）。SQL 鎖 `sid + end_user_id + is_deleted=0`；讀不到就退回前端本機備份（fail-safe） |
+| 對話還原 | `GET /me`、`GET /conversation/{sid}`、`GET /conversations` | `app/memory_store.py::load_history()` / `list_conversations()` | 前端開場：驗 token → 讀回這段對話重建 `history` 與畫面（**含來源清單與立場分佈圖**）。SQL 鎖 `sid + end_user_id + is_deleted=0`；讀不到就退回前端本機備份（fail-safe） |
 | 每輪記憶 | Qdrant `PUT /collections/user_memory/points` | `app/user_memory.py::remember()` | LLM 萃取「關於使用者本人的事實」（沒有就回 NONE 不寫）→ embed → upsert（kind=`turn`） |
 | 登出 | `POST /logout` | `app/api.py::logout` | ①整段摘要 → facts + thread 寫入 Qdrant ②偏好推論 → 白名單/門檻/不覆寫 manual → upsert MySQL ③軟刪 conversation（sid + end_user_id） |
 | 後台管理 | `/api/v1/agents|skills|source-platforms|system-settings|conversations|...` | `admin_backend/*/views.py` | DRF ViewSet + RBAC（Group）+ AuditLog；改設定後 runtime 靠 TTL 或 `/internal/reload-config` 生效 |
@@ -754,8 +762,6 @@ DRF 那側也處理了 N+1：`prefetch_related("skills")` / `prefetch_related("c
 - 對話上下文仍由**前端每輪帶上來**；`GET /conversation/{sid}` 只在**開場還原**時讀 DB，不是每輪都從 DB 重建 messages。
   這是刻意的（後端維持無狀態），代價是前端仍握有「送什麼上下文給 LLM」的權力。
 - `POST /agents/{id}/test-run/` 目前是樁（回 501）——後台改完設定後，實際驗證要靠 `/internal/reload-config` + 前端試問。
-- **立場分佈圖沒有落地 MySQL**：`message` 表沒有 `chart` 欄位，所以走 `GET /conversation/{sid}` 還原時圖不會回來
-  （只有 `localStorage` 那份本機備份存得回）。要跨裝置還原得幫 `message` 加一欄。
 - **統計的「準」建立在分類的「準」上**：加總是程式做的、不會錯，但每一則被歸到哪一類仍是 LLM 判的。
   已用 `temperature=0` + 只收軸內標籤 + 每筆留下判讀依據（可人工抽查）壓風險，但**沒有第二個模型交叉驗證**。
   樣本 < 8 則時前端只秀則數不秀百分比，也是同一個保守考量。

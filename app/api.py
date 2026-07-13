@@ -8,7 +8,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import requests
@@ -16,7 +17,7 @@ from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import agent, memory_store, progress, user_memory, user_preference
+from . import agent, dcard_live, memory_store, progress, user_memory, user_preference
 from .agent import run
 from .auth import end_user_id_from_token
 from .config import settings
@@ -24,7 +25,20 @@ from .config_repo import repo
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="社群輿情智能問答")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """關機收尾：把 Dcard 那顆 Chrome 收掉。
+
+    它是 DrissionPage 啟動的獨立子行程，uvicorn 結束不會帶走它——不收就變孤兒，
+    `--reload` 每存一次檔堆一顆。爬完不關是刻意的（保溫過 Cloudflare 的 session），
+    但「行程結束」是唯一該關的時機。`dcard_live` 另有 atexit 當保險絲。
+    """
+    yield
+    dcard_live.shutdown()
+
+
+app = FastAPI(title="社群輿情智能問答", lifespan=lifespan)
 
 _DEMO_PAGE = Path(__file__).parent / "static" / "ws_demo.html"
 _TERMINAL_EVENTS = ("done", "cancelled", "error")
@@ -68,6 +82,7 @@ class HistoryMsg(BaseModel):
     role: str               # 'user' | 'assistant'
     content: str
     sources: list[Source] = []  # 只有 assistant 有；還原時前端要重畫來源清單
+    chart: dict | None = None   # 有做過立場統計的那輪才有；還原時前端要重畫圖
 
 
 class HistoryResp(BaseModel):
@@ -94,6 +109,19 @@ def reload_config() -> dict:
     return {"reloaded": True}
 
 
+@app.post("/internal/close-browser")
+def close_browser() -> dict:
+    """收掉 Dcard 的 Chrome（下次要爬時會自動重開）。
+
+    為什麼需要這個「用打的」端點，而不是只靠 lifespan / atexit：**關閉路徑不一定跑得到那些鉤子**。
+    `start.ps1` 是用 `taskkill /F` 硬殺（不給收尾機會），`--reload` 殺舊 worker 也一樣——
+    而 Windows 不會連帶帶走子行程，那顆 Chrome 就變成沒有父行程的孤兒、繼續佔著記憶體。
+    所以關機腳本改成「先打這支端點請它自己乾淨地關掉，再去 taskkill」。
+    """
+    dcard_live.shutdown()
+    return {"closed": True}
+
+
 @app.post("/ask", response_model=AskResp)
 def ask(req: AskReq, authorization: str | None = Header(default=None)) -> AskResp:
     end_user_id = end_user_id_from_token(authorization)  # 驗證 token；沒帶/無效 → 匿名
@@ -110,6 +138,7 @@ def ask(req: AskReq, authorization: str | None = Header(default=None)) -> AskRes
         req.session_id, req.message, result["answer"],
         used_tools=result.get("used_tools"), sources=result.get("sources"),
         agent_id=(repo.get_active_agent() or {}).get("id"), end_user_id=end_user_id,
+        chart=result.get("chart"),
     )
     # 個人化長期記憶：萃取『使用者事實』後存進向量記憶（fail-safe；匿名/無事實自動略過）
     user_memory.remember(end_user_id, req.message, result["answer"], session_id=req.session_id)
@@ -152,6 +181,8 @@ def get_conversation(sid: str, authorization: str | None = Header(default=None))
 
     身分只認 token：匿名 → 回空（沒有可還原的東西，不是錯誤）。SQL 同時鎖 sid + end_user_id
     + is_deleted=0，所以知道別人的 sid 也讀不到、登出軟刪過的對話也不會被還原。
+
+    回應帶 sources 與 chart：兩者都是「答案的一部分」，少帶哪一個，F5 之後畫面就殘缺。
     """
     end_user_id = end_user_id_from_token(authorization)
     rows = memory_store.load_history(sid, end_user_id)
@@ -162,6 +193,7 @@ def get_conversation(sid: str, authorization: str | None = Header(default=None))
                 role=r["role"], content=r["content"],
                 sources=[Source(**{k: s.get(k, "") for k in ("title", "url", "created_at", "source")})
                          for s in r.get("sources", []) if s.get("url")],
+                chart=r.get("chart"),
             )
             for r in rows
         ],
@@ -248,6 +280,7 @@ def _run_blocking(question: str, history: list[dict], session_id: str,
         session_id, question, result["answer"],
         used_tools=result.get("used_tools"), sources=sources,
         agent_id=(repo.get_active_agent() or {}).get("id"), end_user_id=end_user_id,
+        chart=result.get("chart"),
     )
     user_memory.remember(end_user_id, question, result["answer"], session_id=session_id)
     emit({

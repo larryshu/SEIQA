@@ -52,6 +52,9 @@ class Message(models.Model):
     content = models.TextField()
     used_tools = models.JSONField(null=True, blank=True)   # ["community_search"]
     sources = models.JSONField(null=True, blank=True)      # [{title,url,source,created_at}]
+    # stance_breakdown 的統計結果（counts/percent/by_platform/items…）。沒呼叫該 skill 就是 NULL。
+    # 落地的理由：圖是「答案的一部分」——不存的話，使用者 F5 後答案回得來、圖卻不見了。
+    chart = models.JSONField(null=True, blank=True)
     token_usage = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

@@ -304,19 +304,30 @@ const PALETTE = ["var(--accent)", "var(--red)", "var(--muted)", "var(--green)", 
 const colorOf = (stance, i) => STANCE_COLOR[stance] || PALETTE[i % PALETTE.length];
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+/** 依 categories（後端給的分類軸順序）列出 [類別, 則數]。
+ *  不能直接用 Object.entries(counts)：chart 落地 MySQL 的 JSON 欄位後，**物件的 key 會被重新排序**
+ *  （MySQL 原生 JSON 會正規化 key 順序），還原出來的圖切片順序、以及自訂分類軸的配色（按索引取調色盤）
+ *  就會跟當下看到的那張不一樣。categories 是 JSON 陣列、保序，拿它當唯一的順序來源。 */
+function orderedCounts(data) {
+  const counts = data.counts || {};
+  const cats = Array.isArray(data.categories) && data.categories.length
+    ? data.categories : Object.keys(counts);
+  return cats.map(c => [c, counts[c] || 0]);
+}
+
 function arc(cx, cy, r, from, to) {
   const p = a => [cx + r * Math.cos(a * Math.PI / 180), cy + r * Math.sin(a * Math.PI / 180)];
   const [x1, y1] = p(from), [x2, y2] = p(to);
   return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${to - from > 180 ? 1 : 0} 1 ${x2} ${y2} Z`;
 }
 
-function pie(counts, total) {
+function pie(entries, total) {
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.setAttribute("viewBox", "0 0 160 160");
   svg.setAttribute("width", "150");
   svg.setAttribute("height", "150");
   let angle = -90;                                  // 從正上方開始，順時針
-  Object.entries(counts).forEach(([stance, n], i) => {
+  entries.forEach(([stance, n], i) => {
     if (!n) return;
     const sweep = n * 360 / total;
     const shape = sweep >= 359.999                  // 只有一種立場：整圓（弧線畫不出 360°）
@@ -345,15 +356,17 @@ function renderChart(box, data) {
   issue.className = "issue";
   issue.textContent = `議題：${data.issue}`;        // textContent：議題字串由 LLM 產生，不當 HTML
 
+  const entries = orderedCounts(data);   // 圖與圖例共用同一個順序（見 orderedCounts）
+
   const body = document.createElement("div");
   body.className = "body";
-  body.appendChild(pie(data.counts, data.total));
+  body.appendChild(pie(entries, data.total));
 
   const byStance = {};
   for (const it of data.items || []) (byStance[it.stance] ||= []).push(it);
 
   const list = document.createElement("ul");
-  Object.entries(data.counts).forEach(([stance, n], i) => {
+  entries.forEach(([stance, n], i) => {
     const li = document.createElement("li");
     const dot = document.createElement("span");
     dot.className = "dot";
@@ -384,8 +397,8 @@ function renderChart(box, data) {
   if (platforms.length > 1) {                       // 只有一個平台時這行是廢話
     const split = document.createElement("div");
     split.className = "split";
-    split.textContent = platforms
-      .map(([p, c]) => `${p}：` + Object.entries(c).map(([s, n]) => `${s} ${n}`).join(" / "))
+    split.textContent = platforms                   // 內層也照 entries 的順序，跟圖例對得起來
+      .map(([p, c]) => `${p}：` + entries.map(([s]) => `${s} ${c[s] || 0}`).join(" / "))
       .join("　｜　");
     box.appendChild(split);
   }
@@ -414,21 +427,22 @@ function renderRestored(list) {
     node.answer.classList.remove("streaming");   // 還原的不是正在生成的
     node.answer.textContent = t.a;
     setLight(node.light, (t.sources || []).length > 0);
-    if (t.chart) renderChart(node.chart, t.chart);   // 只有本機備份存得回圖（見 toTurns 註解）
+    if (t.chart) renderChart(node.chart, t.chart);   // 那一輪有做過立場統計才有圖
     renderSources(node.sources, t.sources || []);
   }
 }
 
-/** 後端回的是逐則訊息（[{role, content, sources}]），畫面要的是逐輪（q/a）→ 配對成對。
- *  註：立場分佈圖（chart）目前沒有落地到 MySQL 的 message 表，所以走後端還原這條路時
- *  圖不會回來（本機備份那份才有）。要讓它跨裝置還原，得幫 message 加一個 chart 欄位。 */
+/** 後端回的是逐則訊息（[{role, content, sources, chart}]），畫面要的是逐輪（q/a）→ 配對成對。
+ *  sources 與 chart 都掛在 assistant 那則上——兩個都要帶進來，少一個 F5 後畫面就殘缺
+ *  （restore() 只要後端有回內容就以後端為準，不會再去看本機那份備份）。 */
 function toTurns(messages) {
   const out = [];
   for (let i = 0; i < messages.length; i++) {
     if (messages[i].role !== "user") continue;
     const next = messages[i + 1];
     if (!next || next.role !== "assistant") continue;  // 落單的 user（例如被取消那輪）就跳過
-    out.push({ q: messages[i].content, a: next.content, sources: next.sources || [] });
+    out.push({ q: messages[i].content, a: next.content,
+               sources: next.sources || [], chart: next.chart || null });
   }
   return out;
 }

@@ -9,7 +9,8 @@ from .models import Conversation, MemoryCollection, Message
 class MessageSerializer(serializers.ModelSerializer):
     class Meta:
         model = Message
-        fields = ["id", "role", "content", "used_tools", "sources", "created_at"]
+        # chart：立場統計結果；後台檢視/匯出對話時也該看得到那一輪畫了什麼圖
+        fields = ["id", "role", "content", "used_tools", "sources", "chart", "created_at"]
 
 
 class ConversationSerializer(serializers.ModelSerializer):
