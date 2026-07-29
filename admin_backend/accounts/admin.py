@@ -39,8 +39,13 @@ class AuditLogAdmin(admin.ModelAdmin):
     search_fields = ("target_id",)
     readonly_fields = ("actor", "action", "target_type", "target_id", "changes", "ip", "created_at")
 
+    # 稽核必須是 append-only：能被竄改或刪除的稽核等於沒有稽核。
+    # 三個權限全關（含 superuser）——要清理只能走 DB 或另寫保留期的排程。
     def has_add_permission(self, request):
-        return False  # 稽核只由系統寫入
+        return False  # 只由系統寫入（AuditLogMixin）
 
     def has_change_permission(self, request, obj=None):
         return False  # 唯讀
+
+    def has_delete_permission(self, request, obj=None):
+        return False  # 不可刪——否則做壞事的人可以順手把自己的紀錄抹掉

@@ -31,6 +31,26 @@ class SystemSettingViewSet(AuditLogMixin, viewsets.ModelViewSet):
     filterset_fields = ["group_name", "is_secret"]  # ?group_name=retrieval
     search_fields = ["key", "description"]
 
+    def _sensitive_fields(self):
+        """is_secret 的設定，value 本身就是機密（例：API 金鑰）——稽核要遮掉（規格 §11.5）。
+
+        但只遮這種：一般設定（chat_model=gpt-4.1）的值留在稽核裡才查得出「誰把模型換掉了」。
+        key 一律保留——它是識別碼，遮掉就不知道改的是哪一條。
+        """
+        fields = super()._sensitive_fields()
+        return fields | {"value"} if self._target_is_secret() else fields
+
+    def _target_is_secret(self) -> bool:
+        data = getattr(self.request, "data", None)
+        flag = data.get("is_secret") if hasattr(data, "get") else None
+        if flag is None:  # PATCH 沒帶 is_secret → 看 DB 現況
+            key = self.kwargs.get(self.lookup_field)
+            if not key:
+                return False
+            flag = SystemSetting.objects.filter(key=key).values_list(
+                "is_secret", flat=True).first()
+        return str(flag).strip().lower() in ("1", "true")
+
     def perform_create(self, serializer):
         serializer.save(updated_by=self.request.user if self.request.user.is_authenticated else None)
         self._write_audit("create", serializer.instance.key, self._audit_changes())

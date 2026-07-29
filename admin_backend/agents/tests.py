@@ -5,6 +5,7 @@ N+1 那兩條是「效能迴歸測試」：不寫死查詢次數（Django 版本
 """
 from __future__ import annotations
 
+from accounts.audit import REDACTED
 from accounts.models import AuditLog
 from testutils import RoleAPITestCase
 
@@ -211,7 +212,8 @@ class AuditTests(RoleAPITestCase):
         self.assertEqual(log.action, "create")
         self.assertEqual(log.actor, self.users["editor"])
 
-    def test_sensitive_fields_are_stripped_from_the_audit_trail(self):
+    def test_sensitive_values_are_redacted_but_the_field_name_is_kept(self):
+        """遮值不遮欄位名：稽核要答得出「他動了 password 這一欄」，只是不記內容。"""
         self.as_role("editor")
 
         self.client.post(
@@ -221,8 +223,39 @@ class AuditTests(RoleAPITestCase):
         )
 
         log = AuditLog.objects.get(target_type="skill")
-        self.assertNotIn("password", log.changes)
+        self.assertEqual(log.changes["password"], REDACTED)
+        self.assertNotIn("hunter2", str(log.changes))  # 明碼絕不能出現在稽核裡
         self.assertEqual(log.changes["name"], "s1")
+
+    def test_fields_merely_containing_key_are_not_redacted(self):
+        """handler_key 是識別碼不是機密。
+
+        舊版用「欄位名包含 key/secret/token」來濾，會把 handler_key、adapter_key、
+        甚至 system_setting.key 一起誤殺——稽核就再也看不出改的是哪一條設定。
+        """
+        self.as_role("editor")
+
+        self.client.post(
+            SKILLS_URL,
+            {"name": "s1", "description": "d", "handler_key": "community_search"},
+            format="json",
+        )
+
+        log = AuditLog.objects.get(target_type="skill")
+        self.assertEqual(log.changes["handler_key"], "community_search")
+
+    def test_platform_adapter_key_is_not_redacted(self):
+        self.as_role("editor")
+
+        self.client.post(
+            PLATFORMS_URL,
+            {"name": "dcard", "display_name": "Dcard", "adapter_key": "dcard",
+             "kind": "live_crawl"},
+            format="json",
+        )
+
+        log = AuditLog.objects.get(target_type="source_platform")
+        self.assertEqual(log.changes["adapter_key"], "dcard")
 
 
 class QueryCountRegressionTests(RoleAPITestCase):

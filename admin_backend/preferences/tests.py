@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 
+from accounts.audit import REDACTED
 from accounts.models import AuditLog, EndUser
 from testutils import RoleAPITestCase
 
@@ -45,6 +46,63 @@ class SystemSettingTests(RoleAPITestCase):
         resp = self.client.patch(f"{SETTINGS_URL}chat_model/", {"value": "gpt-4o"}, format="json")
 
         self.assertEqual(resp.status_code, 403)
+
+
+class SystemSettingAuditTests(RoleAPITestCase):
+    """稽核要記得出「改了哪一條、改成什麼」，但機密的值不能落地。
+
+    舊版用「欄位名包含 key」在濾，把 system_setting 的 key 一起殺了——
+    稽核只剩一個 value，看不出改的是哪一條設定；而真正可能是機密的 value 反而留著。
+    """
+
+    def setUp(self):
+        self.as_role("editor")
+
+    def test_audit_records_which_setting_was_changed(self):
+        SystemSetting.objects.create(key="chat_model", value="gpt-4.1", group_name="llm")
+
+        self.client.patch(f"{SETTINGS_URL}chat_model/", {"value": "gpt-4o"}, format="json")
+
+        log = AuditLog.objects.get(target_type="system_setting")
+        self.assertEqual(log.target_id, "chat_model")   # lookup_field="key"
+        self.assertEqual(log.changes["value"], "gpt-4o")  # 一般設定的值要留，才查得出誰把模型換掉
+
+    def test_key_survives_the_redaction(self):
+        self.client.post(
+            SETTINGS_URL,
+            {"key": "search_min_score", "value": "0.35", "group_name": "retrieval"},
+            format="json",
+        )
+
+        log = AuditLog.objects.get(target_type="system_setting")
+        self.assertEqual(log.changes["key"], "search_min_score")
+
+    def test_secret_settings_value_is_redacted(self):
+        """is_secret 的設定，value 本身就是機密（例：API 金鑰）——遮值，但 key 要留。"""
+        resp = self.client.post(
+            SETTINGS_URL,
+            {"key": "llm_api_key", "value": "sk-super-secret", "group_name": "llm",
+             "is_secret": True},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 201, resp.data)
+        log = AuditLog.objects.get(target_type="system_setting")
+        self.assertEqual(log.changes["key"], "llm_api_key")     # 看得出改了哪一條
+        self.assertEqual(log.changes["value"], REDACTED)        # 但值不落地
+        self.assertNotIn("sk-super-secret", str(log.changes))
+
+    def test_patching_a_secret_setting_redacts_even_without_is_secret_in_body(self):
+        """PATCH 只送 value、沒帶 is_secret 時，要去看 DB 現況，不能就這樣放行。"""
+        SystemSetting.objects.create(key="llm_api_key", value="old", group_name="llm",
+                                     is_secret=True)
+
+        self.client.patch(f"{SETTINGS_URL}llm_api_key/", {"value": "sk-rotated"},
+                          format="json")
+
+        log = AuditLog.objects.get(target_type="system_setting")
+        self.assertEqual(log.changes["value"], REDACTED)
+        self.assertNotIn("sk-rotated", str(log.changes))
 
 
 class EndUserPreferenceTests(RoleAPITestCase):

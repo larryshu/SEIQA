@@ -6,13 +6,15 @@
 from __future__ import annotations
 
 import jwt
+from django.contrib.admin import site
+from django.contrib.auth.models import User
 from django.core.cache import cache
-from django.test import override_settings
+from django.test import RequestFactory, TestCase, override_settings
 from rest_framework.test import APITestCase
 
 from testutils import RoleAPITestCase
 
-from .models import EndUser
+from .models import AuditLog, EndUser
 
 REGISTER_URL = "/api/v1/end-auth/register/"
 LOGIN_URL = "/api/v1/end-auth/login/"
@@ -192,6 +194,30 @@ class ThrottleTests(APITestCase):
             resp = self.client.get(ME_URL)  # 沒帶身分 → 401，但不該變成 429
 
         self.assertEqual(resp.status_code, 401)
+
+
+class AuditLogAdminTests(TestCase):
+    """稽核是 append-only：連 superuser 都不能在 Admin 裡新增/修改/刪除。
+
+    刪除那條最要緊——擋不住的話，做壞事的人可以順手把自己的紀錄抹掉，
+    「你的稽核能不能被竄改」的答案就會是「能」。
+    """
+
+    def setUp(self):
+        self.request = RequestFactory().get("/admin/")
+        self.request.user = User.objects.create_superuser(username="root", password="pw")
+        self.audit_admin = site._registry[AuditLog]
+
+    def test_superuser_cannot_add_change_or_delete_audit_logs(self):
+        self.assertFalse(self.audit_admin.has_add_permission(self.request))
+        self.assertFalse(self.audit_admin.has_change_permission(self.request))
+        self.assertFalse(self.audit_admin.has_delete_permission(self.request))
+
+    def test_every_field_is_read_only(self):
+        self.assertEqual(
+            set(self.audit_admin.readonly_fields),
+            {"actor", "action", "target_type", "target_id", "changes", "ip", "created_at"},
+        )
 
 
 class MeViewTests(RoleAPITestCase):
