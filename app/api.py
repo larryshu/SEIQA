@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import agent, dcard_live, memory_store, progress, user_memory, user_preference
+from . import agent, dcard_live, memory_store, progress, suggest, user_memory, user_preference
 from .agent import run
 from .auth import end_user_id_from_token
 from .config import settings
@@ -283,6 +283,12 @@ def _run_blocking(question: str, history: list[dict], session_id: str,
         chart=result.get("chart"),
     )
     user_memory.remember(end_user_id, question, result["answer"], session_id=session_id)
+    # 追問建議：依這一輪問答產生幾個 follow-up（fail-safe，產不出來就回 []）。
+    # 只在 done 這條路徑做；cancelled/error 不做。放這裡＝晚 ~1s，但答案文字早已串流完。
+    # memories：agent 這輪已撈回的使用者事實，直接沿用（suggest 不再搜一次——同 query 結果一樣，
+    # 且上一行的 remember() 已把本輪事實寫進去了，重搜會撈到剛寫的自己）。
+    suggestions = suggest.suggest_followups(question, result["answer"], sources,
+                                            memories=result.get("memories"))
     emit({
         "type": "done",
         "answer": result["answer"],
@@ -290,6 +296,7 @@ def _run_blocking(question: str, history: list[dict], session_id: str,
         "sources": [s for s in sources if s.get("url")],
         "light": "green" if sources else "yellow",  # 🟢 有社群來源／🟡 LLM 既有常識
         "chart": result.get("chart"),  # 圖表已由 chart 事件即時畫出；這裡帶著是為了 /ask 與還原
+        "suggestions": suggestions,    # 追問建議（前端點了填入輸入框可改再送；不進 history）
     })
 
 

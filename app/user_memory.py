@@ -172,6 +172,28 @@ def _conversation_text(messages: list[dict], max_chars: int = 4000) -> str:
     return "\n".join(lines)[-max_chars:]
 
 
+def _as_fact(v) -> str:
+    """把 LLM 回的一個欄位收斂成字串；不是 str/dict 就回 ''（寧可漏寫，也不讓垃圾進庫）。
+
+    起因：模型偶爾不照 schema，把 facts 元素回成 {"使用者": "持續關心…"} 這種物件。舊寫法
+    直接 str(v)，於是 "{'使用者': '持續關心…'}" 原樣存進向量庫，注入 prompt 時就長那樣。
+    這裡把觀察到的 {主詞: 述語} 接回原本要的那一句；值本身已是完整句就直接用。
+
+    非 str/dict（數字、陣列…）刻意回 ''：這種形狀沒有合理的還原方式，硬轉只會產生新的
+    垃圾字串。回 '' 讓呼叫端當作「這欄沒有」——facts 少一條、thread 不寫，都是安全的失敗。
+    """
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, dict):
+        out = []
+        for k, val in v.items():
+            val, k = str(val).strip(), str(k).strip()
+            if val:
+                out.append(val if val.startswith("使用者") else f"{k}{val}")
+        return "；".join(out)
+    return ""
+
+
 def _parse_summary(raw: str) -> dict:
     """解析 LLM 的 {facts, thread}；容錯去 markdown 圍籬、去 NONE；缺欄位回空結構。"""
     empty = {"facts": [], "thread": {"headline": "", "narrative": ""}}
@@ -186,11 +208,11 @@ def _parse_summary(raw: str) -> dict:
     if not isinstance(data, dict):
         return empty
     raw_facts = data.get("facts")
-    facts = ([str(f).strip() for f in raw_facts if str(f).strip()][:3]
+    facts = ([f for f in (_as_fact(x) for x in raw_facts) if f][:3]
              if isinstance(raw_facts, list) else [])
     thread = data.get("thread") if isinstance(data.get("thread"), dict) else {}
-    headline = str(thread.get("headline", "") or "").strip()
-    narrative = str(thread.get("narrative", "") or "").strip()
+    headline = _as_fact(thread.get("headline"))
+    narrative = _as_fact(thread.get("narrative"))
     if headline.upper() == "NONE":
         headline = ""
     if narrative.upper() == "NONE":
@@ -226,7 +248,10 @@ def _summarize_conversation(transcript: str) -> dict:
             "較常青的通則建議可保留（例：減脂靠熱量赤字＋規律運動、重訓保肌、睡眠充足）。\n"
             "若整段對話沒有值得長期記住的個人脈絡（純查資料／純常識／純計算），"
             "facts 給 []、thread 兩欄給空字串。\n"
-            "嚴格輸出 JSON：{\"facts\":[..],\"thread\":{\"headline\":..,\"narrative\":..}}；"
+            "嚴格輸出 JSON。facts 的每個元素必須是一個完整的字串句子，不可以是物件；"
+            "headline 與 narrative 也必須是字串。格式範例："
+            "{\"facts\":[\"使用者是後端工程師，具備爬蟲相關經驗\"],"
+            "\"thread\":{\"headline\":\"求職與薪資行情探討\",\"narrative\":\"使用者…\"}}；"
             "只輸出 JSON，不要 markdown、不要解釋。"
         )},
         {"role": "user", "content": transcript},

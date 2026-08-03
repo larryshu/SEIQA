@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 from . import llm, progress, user_memory
+from .config import settings
 from .config_repo import repo
 from .llm import chat_with_tools
 from .tools import TOOLS, dispatch
@@ -94,14 +95,50 @@ def _apply_memory(prompt: str, memories: list[str], meta: bool = False) -> str:
 def _apply_thread_context(prompt: str, threads: list[str]) -> str:
     """把『先前相關對話的脈絡』(thread 記憶) 附到 system prompt 後。
 
-    脈絡含『先前討論過的重點梗概』，可用來回顧、喚回聊過的內容；但加註『要最新狀況仍以本次
-    查到為準』，避免模型把舊梗概當成當下事實、不再即時查證。
+    舊版只寫『供了解使用者背景』，模型於是把它當默讀資料——讀了卻一個字都不提，使用者
+    完全感覺不到記憶生效。現在改成請它『開場先回顧一兩句，主體仍以本次查到的為準』：
+    溫故（喚回聊過的內容）與知新（本次最新風向）並存，且能點出兩者的差異。
+
+    settings.thread_recap_enabled 關掉時退回舊行為（只當背景、不明講）——與
+    user_thread_enabled 不同層級：那個是關掉整條脈絡軌，這個只關『說出來』這件事。
     """
     if not threads:
         return prompt
     lines = "\n".join(f"- {t}" for t in threads)
-    return (prompt + "\n\n【先前相關對話的脈絡（供了解使用者背景、回顧先前討論過的重點；"
-            "若使用者要最新狀況，仍以本次查到的最新討論為準）】\n" + lines)
+    if not settings.thread_recap_enabled:
+        return (prompt + "\n\n【先前相關對話的脈絡（供了解使用者背景、回顧先前討論過的重點；"
+                "若使用者要最新狀況，仍以本次查到的最新討論為準）】\n" + lines)
+    return (prompt + "\n\n【先前相關對話的脈絡——你和這位使用者聊過的內容。使用方式：\n"
+            "1. 只要脈絡與本題『主題相關』就要回顧——**不必是同一件事**，這次問得比較廣、"
+            "換了對象或換了時間點都算相關。開場先用一兩句講明那是之前聊過的、當時的重點是"
+            "什麼（例：你之前問過台北市那次放颱風假的評價，當時社群主要分成…）；\n"
+            "2. 回顧只是引子——主體與結論一律以本次查到的最新討論為準，不可讓舊梗概"
+            "取代或稀釋這次的內容；\n"
+            "3. 回顧的句子不可標 [n]：[n] 只屬於本次查到的貼文，舊脈絡沒有對應來源，"
+            "標上去就是假出處；\n"
+            "4. 若本次查到的風向和先前討論不同，明確點出變化（例：上次討論時主流是…，"
+            "這次多了…），這比單純複述更有價值；\n"
+            "5. 若脈絡與本題其實不夠相關，就完全不要提——硬扯比不提更糟。】\n" + lines)
+
+
+# meta 問題（「你記得我什麼」）會列出全部記憶注入 prompt；但交給追問建議器時截短——
+# 建議器只需要「這個人是誰」來選面向，不需要整份清單，也不值得為它多花 token。
+_SUGGEST_MEMORY_CAP = 8
+
+
+def _refresh_recap_hint(messages: list[dict], ctx: "_RunContext") -> None:
+    """把回顧提醒移到 messages 最尾端（沒有脈絡就什麼都不做）。
+
+    為什麼需要這個：工具結果很長時，system prompt 裡的回顧要求會被稀釋掉。實測同一份
+    prompt／模型／溫度，工具回傳 959 字時模型會回顧，9,106 字（83 篇貼文）就完全不提了；
+    而且 community_search 的回傳自己結尾就是「請綜合這些來源回答、用 [n] 標注」，近因上
+    壓過了 system。所以每輪工具跑完都把提醒重新貼到最後，確保它緊鄰生成點。
+    """
+    if not ctx.recap_hint:
+        return
+    for m in [m for m in messages if m.get("content") == ctx.recap_hint]:
+        messages.remove(m)
+    messages.append({"role": "system", "content": ctx.recap_hint})
 
 
 class _RunContext(NamedTuple):
@@ -112,6 +149,8 @@ class _RunContext(NamedTuple):
     model: str | None
     temperature: float
     max_rounds: int
+    memories: list[str]  # 本輪撈回的『使用者原子事實』；順著回傳給追問建議器做個人化
+    recap_hint: str      # 命中脈絡時的回顧提醒；空＝沒脈絡或關閉（見 _refresh_recap_hint）
 
 
 def _build_context(user_message: str, history: list[dict] | None,
@@ -125,16 +164,34 @@ def _build_context(user_message: str, history: list[dict] | None,
     prefs = repo.get_user_preferences(end_user_id) if end_user_id else {}
     # 取值優先序：user_preference > agent > system_setting/.env
     system_prompt = _apply_pref_modifiers(cfg.get("system_prompt") or SYSTEM_PROMPT, prefs)
+    memories: list[str] = []
+    threads: list[str] = []
     if end_user_id:  # 登入使用者：meta 問題列出全部記憶；一般問題語意撈回（皆 fail-safe）
-        if user_memory.is_memory_query(user_message):
-            system_prompt = _apply_memory(
-                system_prompt, user_memory.list_memories(end_user_id), meta=True)
+        meta = user_memory.is_memory_query(user_message)
+        if meta:
+            listed = user_memory.list_memories(end_user_id)
+            memories = listed[:_SUGGEST_MEMORY_CAP]  # meta 問題會列出全部，給建議器時截短
+            n_facts = len(listed)                    # 回報「實際注入」的量，不是截短後的
+            system_prompt = _apply_memory(system_prompt, listed, meta=True)
         else:
-            system_prompt = _apply_memory(
-                system_prompt, user_memory.recall(end_user_id, user_message))
+            memories = user_memory.recall(end_user_id, user_message)
+            n_facts = len(memories)
+            system_prompt = _apply_memory(system_prompt, memories)
             # 脈絡記憶（thread）另一條：命中相關舊對話 → 注入背景區塊（皆 fail-safe）
-            system_prompt = _apply_thread_context(
-                system_prompt, user_memory.recall_threads(end_user_id, user_message))
+            threads = user_memory.recall_threads(end_user_id, user_message)
+            system_prompt = _apply_thread_context(system_prompt, threads)
+        # 讓「記憶有沒有生效」在前端看得見：脈絡注入後會刻意退居背景（答案仍以本次爬到的
+        # 最新討論為準），使用者因此感覺不到它。這裡只回報有沒有載到、載了幾則，不動答案。
+        # 沒撈到就不發，避免每題都多一行雜訊；/ask 沒有訂閱者時 emit 是 no-op。
+        if n_facts or threads:
+            progress.emit("memory_loaded", facts=n_facts, threads=len(threads), meta=meta)
+    recap_hint = ""
+    if threads and settings.thread_recap_enabled:
+        recap_hint = (
+            "（提醒：本輪有【先前相關對話的脈絡】。請照 system 的指示——開場先用一兩句回顧"
+            "之前聊過的重點再進入主體；回顧那句不可標 [n]；主體與結論仍以上面查到的最新討論"
+            "為準；風向有變就點出差異。若脈絡與本題確實不相關，就完全不要提。）"
+        )
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(history or [])
@@ -146,12 +203,19 @@ def _build_context(user_message: str, history: list[dict] | None,
         model=prefs.get("model") or cfg.get("model"),  # None → llm 用 settings.chat_model
         temperature=cfg.get("temperature", 0.2),
         max_rounds=cfg.get("max_tool_rounds") or MAX_TOOL_ROUNDS,
+        memories=memories,
+        recap_hint=recap_hint,
     )
 
 
 def run(user_message: str, history: list[dict] | None = None, session_id: str = "default",
         end_user_id: int | None = None) -> dict:
-    """跑一輪對話（阻塞式，一次回完整答案）。回傳 {answer, used_tools, sources, messages}。"""
+    """跑一輪對話（阻塞式，一次回完整答案）。回傳 {answer, used_tools, sources, messages, memories}。
+
+    memories：本輪撈回的使用者原子事實，順帶回傳供追問建議器個人化——刻意不讓 suggest 自己
+    再 recall 一次：一來同 query 同 collection 結果一樣、白付一次 embed；二來 api 那邊
+    remember() 跑在 suggest 之前，重搜會高分命中剛寫進去的本輪事實，等於把問題換句話說餵回去。
+    """
     ctx = _build_context(user_message, history, end_user_id)
     messages = ctx.messages
 
@@ -163,7 +227,8 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
         if not msg.tool_calls:
             messages.append({"role": "assistant", "content": msg.content or ""})
             return {"answer": msg.content or "", "used_tools": used_tools, "sources": sources,
-                    "chart": charts[-1] if charts else None, "messages": messages}
+                    "chart": charts[-1] if charts else None, "messages": messages,
+                    "memories": ctx.memories}
 
         # 有 tool_calls：先把 assistant 這輪（含 tool_calls）原樣存回，再逐一執行
         messages.append(msg.model_dump(exclude_none=True))
@@ -175,6 +240,7 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": result}
             )
+        _refresh_recap_hint(messages, ctx)  # 工具結果很長會蓋掉 system 的回顧要求
 
     # 工具輪數用完 → 收尾這一刀 tool_choice="none"：不准再叫工具，逼它用手上的資料回話。
     # （否則模型可能再要一次工具、content 回空，使用者就會看到「已達工具呼叫上限」那句廢話。）
@@ -183,7 +249,8 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
     answer = final.content or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
     messages.append({"role": "assistant", "content": answer})
     return {"answer": answer, "used_tools": used_tools, "sources": sources,
-            "chart": charts[-1] if charts else None, "messages": messages}
+            "chart": charts[-1] if charts else None, "messages": messages,
+            "memories": ctx.memories}
 
 
 def _stream_once(ctx: _RunContext, messages: list[dict],
@@ -226,7 +293,8 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
                 progress.emit("token", text=answer)
             messages.append({"role": "assistant", "content": answer})
             return {"answer": answer, "used_tools": used_tools, "sources": sources,
-                    "chart": charts[-1] if charts else None, "messages": messages}
+                    "chart": charts[-1] if charts else None, "messages": messages,
+                    "memories": ctx.memories}
 
         # 少數模型會在決定用工具前先吐幾個字。那些字不是答案 → 請前端把已印出的清掉。
         if streamed:
@@ -243,6 +311,7 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
                               end_user_id=end_user_id, charts=charts)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
             progress.emit("tool_done", tool=name, found=len(sources))
+        _refresh_recap_hint(messages, ctx)  # 工具結果很長會蓋掉 system 的回顧要求
 
     progress.raise_if_cancelled()
     progress.emit("stage", stage="answering", text="讀完討論了，開始生成回答…")
@@ -252,4 +321,5 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
         progress.emit("token", text=answer)
     messages.append({"role": "assistant", "content": answer})
     return {"answer": answer, "used_tools": used_tools, "sources": sources,
-            "chart": charts[-1] if charts else None, "messages": messages}
+            "chart": charts[-1] if charts else None, "messages": messages,
+            "memories": ctx.memories}

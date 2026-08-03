@@ -60,6 +60,10 @@ class Settings:
     # 門檻比事實（0.35）高：整段敘事要夠對題才注入，避免鬆散舊脈絡灌爆 system prompt
     user_thread_min_score: float = _float("USER_THREAD_MIN_SCORE", 0.42)
     user_thread_max_chars: int = _int("USER_THREAD_MAX_CHARS", 1200)  # 注入單筆敘事長度上限（含討論重點梗概故拉高）
+    # 命中脈絡時，是否請模型『開場先回顧一兩句』而非只當背景默讀（溫故知新；主體仍以本次查到的為準）。
+    # 與 user_thread_enabled 不同層級：那個關掉整條脈絡軌，這個只關『說出來』、保留背景影響。
+    thread_recap_enabled: bool = os.environ.get(
+        "THREAD_RECAP_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
     # ---- 使用者偏好自動推論（登出時從對話萃取設定旋鈕 → user_preference；比 user_memory 保守）----
     pref_infer_enabled: bool = os.environ.get(
@@ -83,7 +87,7 @@ class Settings:
     # DCARD_MODE=live → 走 DrissionPage 即時爬（全站『文章』搜尋），失敗/空自動 fallback 向量庫；
     # DCARD_MODE=vector → 走 Dcard 口碑庫向量檢索（原本行為，程式碼保留不動）。
     dcard_mode: str = os.environ.get("DCARD_MODE", "live").strip().lower()
-    dcard_time_budget: int = _int("DCARD_TIME_BUDGET", 100)   # 秒；即時爬硬上限，到時回已抓到的（須 < 前端 300s）
+    dcard_time_budget: int = _int("DCARD_TIME_BUDGET", 200)   # 秒；即時爬硬上限，到時回已抓到的（須 < 前端 300s）
     dcard_deep_max: int = _int("DCARD_DEEP_MAX", 18)          # 最多深挖幾篇（進頁抓內文+留言）
     dcard_max_comments: int = _int("DCARD_MAX_COMMENTS", 20)  # 每篇留言取前幾則（依讚數，濾掉貼圖/純網址後）
     dcard_headless: bool = os.environ.get(
@@ -102,6 +106,32 @@ class Settings:
     # 每篇最多掃描幾則留言就停：熱門文動輒數百則，但我們只取前 dcard_max_comments 則熱門，
     # 掃到這個量已足以涵蓋高讚留言，不必捲完全部（否則一篇熱門文就吃光整個時間預算）。
     dcard_comment_scan_max: int = _int("DCARD_COMMENT_SCAN_MAX", 80)
+
+    # Dcard 即時爬：搜到結果後對每篇 title+excerpt 做 embed，跟原問題比 cosine 相似度，
+    # 過門檻才進深挖。避免 Dcard 全文檢索的部分匹配 fallback
+    # （例如搜「福智教育園區」拿回一堆「幼兒園評價」）。
+    dcard_live_rerank_enabled: bool = os.environ.get(
+        "DCARD_LIVE_RERANK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    dcard_live_min_score: float = _float("DCARD_LIVE_MIN_SCORE", 0.5)
+
+    # PTT 即時爬：抓完後對每篇 title+body 前段做 embed，跟原問題比 cosine 相似度，
+    # 過門檻才收。避免 LLM 抽關鍵字時把「看法/評價/心得」這種無主體泛詞單獨搜、
+    # 撈回一堆與問題無關的貼文（如問「福智教育看法」卻拿到「周星馳的評價」）。
+    ptt_rerank_enabled: bool = os.environ.get(
+        "PTT_RERANK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    ptt_min_score: float = _float("PTT_MIN_SCORE", 0.5)
+
+    # ---- 追問建議（follow-up；當輪答完後產生，前端點了填入輸入框可改再送）----
+    suggest_enabled: bool = os.environ.get(
+        "SUGGEST_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    suggest_n: int = _int("SUGGEST_N", 4)                            # 產幾題
+    suggest_temperature: float = _float("SUGGEST_TEMPERATURE", 0.4)  # 要一點變化但別發散
+    # 個人化：把本輪已撈回的使用者記憶（agent 那次 recall 的結果，不另外搜）交給建議器選面向。
+    # 只影響「挑哪個角度」，不准把記憶內容寫進題目——chip 是螢幕上常駐可見的 UI，複述記憶
+    # 等於把個人事實攤在畫面上（截圖／共用螢幕會外洩）。匿名使用者無記憶 → 自動退回通用行為。
+    suggest_personalize: bool = os.environ.get(
+        "SUGGEST_PERSONALIZE", "true").strip().lower() in ("1", "true", "yes", "on")
+    suggest_personalize_max: int = _int("SUGGEST_PERSONALIZE_MAX", 1)  # 至多幾題個人化（其餘保持通用）
 
     # ---- 後台共用 MySQL（M3：唯讀讀設定；db_host 留空＝停用，全走上面的 .env/寫死值）----
     db_host: str = os.environ.get("DB_HOST", "").strip()

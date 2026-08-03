@@ -25,7 +25,8 @@ DRF_能力分級對照專案功能.MD
 # 但依賴清單必須入庫，否則 clone 下來裝不了東西（上面的 *.txt 會把它一起吃掉）
 !requirements.txt
 !requirements-admin.txt
-
+*.jpg
+*.png
 # 本機開發工具設定
 .claude/
 admin_backend/preferences/migrations/

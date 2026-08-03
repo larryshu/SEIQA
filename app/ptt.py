@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import time
 from datetime import datetime
@@ -38,6 +39,8 @@ BOARDS: dict[str, str] = {
     "MobileComm": "手機、通訊、行動裝置",
     "iOS": "iPhone、Apple、iOS",
     "Tech_Job": "科技業、工程師、工作、職場",
+    "AI_Art": "AI、生成式 AI、AI 繪圖、ChatGPT／LLM／大型語言模型討論",
+    "PC_Shopping": "電腦硬體、DIY、顯示卡、組裝、3C 開箱",
     "Boy-Girl": "感情、男女、交往、分手",
     "marriage": "婚姻、夫妻、家庭",
     "car": "汽車、買車、用車",
@@ -53,35 +56,81 @@ BOARDS: dict[str, str] = {
 _DEFAULT_BOARD = "Gossiping"
 
 
-def _plan_search(query: str) -> tuple[str, list[str]]:
-    """用一次 LLM 呼叫決定 (看板, 多個單一關鍵詞)。
+# 純泛用限定詞：單獨拿去搜 PTT 標題會撈到成千上萬不相關文章（問 Kimi K3 卻回一堆
+# 「iPhone 實際照片」）。prompt 已禁，但模型不一定聽——拿回後在程式層用這張表硬過濾兜底。
+_FILLER_KEYWORDS: frozenset[str] = frozenset({
+    "實際", "心得", "評價", "看法", "推薦", "意見", "感想", "體驗", "使用", "應用",
+    "分享", "討論", "開箱", "比較", "選擇", "如何", "怎樣", "怎麼", "一般", "問題",
+    "請問", "介紹", "情況", "狀況", "效果", "表現", "優缺點", "值得", "覺得",
+})
+
+
+def _clean_keywords(keywords: list[str]) -> list[str]:
+    """剔掉純泛用限定詞（心得/實際/評價…），只留有主體的詞；去重保序。
+
+    若整批都是泛用詞（模型完全沒給實體）就退回第一個，至少還有東西可搜、不致變空。
+    """
+    seen: set[str] = set()
+    kept: list[str] = []
+    for k in keywords:
+        if k and k not in _FILLER_KEYWORDS and k not in seen:
+            seen.add(k)
+            kept.append(k)
+    return kept or keywords[:1]
+
+
+def _plan_search(query: str) -> tuple[list[str], list[str]]:
+    """用一次 LLM 呼叫決定 (看板清單 1~2 個, 多個單一關鍵詞)。
 
     PTT 站內搜尋是拿整串查詢字串比對『標題』，且空白分隔的多個詞是 AND——所以
-    「外型 情緒穩定」要求標題同時含兩詞 → 幾乎 0 結果。正解是給『多個單一語詞』各搜一次再合併
-    （像「外型」「擇偶」各 20 筆）。失敗時退回 (Gossiping, [原問句])。
+    「外型 情緒穩定」要求標題同時含兩詞 → 幾乎 0 結果。正解是給『多個單一語詞』各搜一次再合併。
+
+    兩個坑各有對策：
+    - 看板可能選錯，或主題本來就分散在不只一個板（例：LLM 討論在 AI_Art 也可能在 Tech_Job）——
+      故讓 LLM 回 1~2 個板都搜；上層再對「0 對題結果」退回 Gossiping 當第三層網。
+    - 泛用限定詞（「看法」「心得」「實際」）單獨搜會拿到大量雜訊——prompt 先禁，
+      拿回後再用 _clean_keywords 停用表硬過濾兜底。後端還有 embed cosine 二次過濾當保險。
+    失敗退回 ([Gossiping], [原問句])。
     """
     listing = "\n".join(f"- {code}: {desc}" for code, desc in BOARDS.items())
     msgs = [
         {"role": "system", "content": (
-            "你要幫使用者問題規劃 PTT 站內搜尋：(1) 從清單挑一個最相關看板代碼；"
+            "你要幫使用者問題規劃 PTT 站內搜尋：(1) 從清單挑『1~2 個』最相關看板代碼，最相關的排第一；"
+            "只有主題真的可能分散在兩個板才給第二個，否則給一個就好。"
             "(2) 給 1~3 個『單一關鍵詞』。注意：PTT 搜尋會把空白分隔的多個詞當 AND 去比對標題，"
             "所以每個關鍵詞必須是『單一語詞』（約 2~4 字、文章標題可能出現），"
-            "不要把多個概念塞進同一個詞、不要整句問句、不要問號。"
-            "用不同單詞涵蓋問題的不同面向（例如『外型』『擇偶』『個性』）。"
-            '只用 JSON 回：{"board":"看板代碼","keywords":["詞1","詞2"]}\n看板清單：\n' + listing
+            "不要把多個概念塞進同一個詞、不要整句問句、不要問號。\n"
+            "但若『核心實體本身就含空格』（產品/型號/專有名詞，如『Kimi K3』『iPhone 16』），"
+            "要當『一個』關鍵詞整串保留、不可拆成兩個——PTT 對含空格的單一關鍵詞是要求標題"
+            "同時含這幾個字（AND），整串保留反而更精準；拆開各搜會混進不相關的東西。\n"
+            "【最重要】先從問題找出『核心實體』（人名/機構/產品/AI 模型/地點/事件名稱），"
+            "第一個關鍵詞必須就是這個核心實體；其他關鍵詞可以是它的同義變體或相關子項"
+            "（例如核心實體是『福智』→ 可加『福智團』『福智基金會』）。\n"
+            "【絕對禁止】只丟『看法/評價/心得/實際/推薦/意見/如何/怎樣』這種無主體的泛用限定詞——"
+            "PTT 標題含這些字的文章成千上萬，搜這個等於什麼都沒過濾。\n"
+            '只用 JSON 回：{"boards":["主板代碼","備板代碼(可省)"],"keywords":["詞1","詞2"]}\n看板清單：\n' + listing
         )},
         {"role": "user", "content": query},
     ]
     try:
         raw = llm.chat(msgs, temperature=0)
         data = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
-        board_ans = str(data.get("board", "")).strip()
+        raw_boards = data.get("boards", [])
+        if isinstance(raw_boards, str):  # 模型偶爾回單一字串而非陣列
+            raw_boards = [raw_boards]
         keywords = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
     except Exception as e:  # noqa: BLE001
         log.warning("plan_search 失敗，退回 (%s, [原問句])：%s", _DEFAULT_BOARD, e)
-        return _DEFAULT_BOARD, [query]
-    board = next((c for c in BOARDS if board_ans.lower() == c.lower()), _DEFAULT_BOARD)
-    return board, (keywords or [query])
+        return [_DEFAULT_BOARD], [query]
+
+    boards: list[str] = []  # 對回白名單（大小寫不敏感）、去重、上限 2
+    for b in raw_boards:
+        match = next((c for c in BOARDS if str(b).strip().lower() == c.lower()), None)
+        if match and match not in boards:
+            boards.append(match)
+        if len(boards) >= 2:
+            break
+    return (boards or [_DEFAULT_BOARD]), (_clean_keywords(keywords) or [query])
 
 
 class _Throttle:
@@ -179,24 +228,58 @@ def _parse_article(html: str) -> tuple[str, str, str]:
     return title, body, created
 
 
-def search(query: str, board: str | None = None, time_budget: int | None = None) -> list[Post]:
-    """即時搜尋 PTT：挑看板→『邊翻搜尋頁、邊逐篇抓文章』，在時間預算內盡量抓。
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity；長度為零就回 0（fail-safe）。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
 
-    交錯式（streaming）：抓一頁搜尋結果就馬上抓那頁的文章，再翻下一頁——這樣預算會真的花在
-    抓文章上，到時間就停、回已抓到的全部，而不是把預算耗在翻頁。
+
+def _rerank_posts_by_similarity(user_query: str, posts: list[Post],
+                                min_score: float) -> list[Post]:
+    """對抓到的 PTT posts 依語意相關度過濾——避免「看法/評價」單獨搜拿到的雜訊。
+
+    分數 = cosine(embed(user_query), embed(title + body 前段))；保留 >= min_score
+    並依分數重排。fail-safe：embed 失敗就回原 list（不擋整條爬蟲）。
+    批次一次 embed 所有 posts，只多一次 API call。
     """
-    budget = time_budget or settings.ptt_time_budget
-    deadline = time.monotonic() + budget
-    planned_board, keywords = _plan_search(query)
-    chosen = board or planned_board  # 整句問句搜不到，一律用抽出的單一關鍵詞去搜
-    progress.emit("crawl_plan", platform="ptt", board=chosen, keywords=keywords)
-    log.info("PTT 搜尋 board=%s keywords=%r budget=%ds", chosen, keywords, budget)
-
-    sess = _session()
-    th = _Throttle()
-    posts: list[Post] = []
-    seen: set[str] = set()  # 跨關鍵詞以文章 url 去重
+    if not posts or not (user_query or "").strip():
+        return posts
     try:
+        query_vec = llm.embed(user_query)
+        # title + body 前 300 字（body 常含推文雜訊，多了反而稀釋主題訊號）
+        texts = [((p.title or "") + " " + (p.content or "")[:300]).strip() or "空"
+                 for p in posts]
+        client = llm._client()  # noqa: SLF001 — 內部共用 client
+        resp = client.embeddings.create(model=settings.embed_model, input=texts)
+        vecs = [d.embedding for d in resp.data]
+    except Exception as e:  # noqa: BLE001 — 過濾失敗就沿用原結果
+        log.warning("PTT 語意過濾失敗（沿用原抓到的貼文）：%s", e)
+        return posts
+
+    scored = [(p, _cosine(query_vec, v)) for p, v in zip(posts, vecs)]
+    kept = [(p, s) for p, s in scored if s >= min_score]
+    kept.sort(key=lambda x: x[1], reverse=True)
+    dropped = len(scored) - len(kept)
+    log.info("PTT 語意過濾：%d 篇 → %d 篇（門檻 %.2f，丟 %d）",
+             len(scored), len(kept), min_score, dropped)
+    progress.emit("ptt_rerank", kept=len(kept), dropped=dropped,
+                  threshold=min_score, before=len(scored))
+    return [p for p, _ in kept]
+
+
+def _crawl_boards(sess: requests.Session, th: "_Throttle", boards: list[str],
+                  keywords: list[str], deadline: float, seen: set[str],
+                  posts: list[Post]) -> None:
+    """對每個 (看板 × 關鍵詞) 交錯翻搜尋頁、逐篇抓文，append 到 posts（就地累積）。
+
+    交錯式：抓一頁搜尋結果就馬上抓那頁的文章再翻下一頁，讓時間預算真的花在抓文章上。
+    seen 跨看板/關鍵詞以 url 去重；到 deadline 或被取消就停。
+    """
+    for b in boards:
+        if time.monotonic() >= deadline:
+            break
         for kw in keywords:  # 每個單詞各搜一次、合併（解決多詞 AND → 0 結果）
             progress.raise_if_cancelled()
             if time.monotonic() >= deadline:
@@ -205,7 +288,7 @@ def search(query: str, board: str | None = None, time_budget: int | None = None)
             while time.monotonic() < deadline:
                 progress.raise_if_cancelled()
                 th.wait()
-                links = _search_page_links(sess, chosen, kw, page)
+                links = _search_page_links(sess, b, kw, page)
                 if links is None or not links:  # 請求失敗或該詞沒有更多結果
                     break
                 for href in links:
@@ -226,9 +309,48 @@ def search(query: str, board: str | None = None, time_budget: int | None = None)
                                       created_at=created, source="ptt"))
                     progress.emit("crawl_progress", platform="ptt", done=len(posts))
                 page += 1
+
+
+def search(query: str, board: str | None = None, time_budget: int | None = None) -> list[Post]:
+    """即時搜尋 PTT：挑看板→『邊翻搜尋頁、邊逐篇抓文章』，在時間預算內盡量抓。
+
+    交錯式（streaming）：抓一頁搜尋結果就馬上抓那頁的文章，再翻下一頁——這樣預算會真的花在
+    抓文章上，到時間就停、回已抓到的全部，而不是把預算耗在翻頁。
+
+    收完後（如果 PTT_RERANK_ENABLED）用 embed cosine 對 title+body 前段做語意過濾，
+    擋掉「看法/評價/心得」這類泛用限定詞單獨搜命中的雜訊。
+    """
+    budget = time_budget or settings.ptt_time_budget
+    deadline = time.monotonic() + budget
+    planned_boards, keywords = _plan_search(query)
+    boards = [board] if board else planned_boards  # 呼叫端可指定看板；否則用規劃的 1~2 個
+    progress.emit("crawl_plan", platform="ptt", board="、".join(boards), keywords=keywords)
+    log.info("PTT 搜尋 boards=%r keywords=%r budget=%ds", boards, keywords, budget)
+
+    sess = _session()
+    th = _Throttle()
+    posts: list[Post] = []
+    seen: set[str] = set()  # 跨看板/關鍵詞以文章 url 去重
+    try:
+        _crawl_boards(sess, th, boards, keywords, deadline, seen, posts)
         if time.monotonic() >= deadline:
             progress.emit("crawl_budget", platform="ptt", done=len(posts))
-        log.info("PTT 抓到 %d 篇（board=%s, keywords=%r）", len(posts), chosen, keywords)
+        log.info("PTT 抓到 %d 篇（boards=%r, keywords=%r）", len(posts), boards, keywords)
+
+        # 語意過濾：把「看法/評價」單獨搜命中的雜訊（例如問福智卻拿到周星馳的評價）擋掉。
+        if settings.ptt_rerank_enabled and posts:
+            posts = _rerank_posts_by_similarity(query, posts, settings.ptt_min_score)
+            progress.emit("crawl_progress", platform="ptt", done=len(posts))
+
+        # 保險：語意過濾後留 0 篇（多半是看板選錯）→ 退回 Gossiping（最大綜合板，話題多會被轉貼）再搜。
+        if not posts and _DEFAULT_BOARD not in boards and time.monotonic() < deadline:
+            log.info("PTT 主板 %r 無對題結果，退回 %s 再搜", boards, _DEFAULT_BOARD)
+            progress.emit("crawl_plan", platform="ptt",
+                          board=f"{_DEFAULT_BOARD}（退回）", keywords=keywords)
+            _crawl_boards(sess, th, [_DEFAULT_BOARD], keywords, deadline, seen, posts)
+            if settings.ptt_rerank_enabled and posts:
+                posts = _rerank_posts_by_similarity(query, posts, settings.ptt_min_score)
+            progress.emit("crawl_progress", platform="ptt", done=len(posts))
     finally:
         sess.close()
     return posts

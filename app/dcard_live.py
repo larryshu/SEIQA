@@ -16,6 +16,7 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import math
 import random
 import re
 import threading
@@ -412,8 +413,51 @@ def _to_post(meta: dict[str, Any], full: dict[str, Any] | None,
     )
 
 
-def _run(keywords: list[str], deep_max: int, deadline: float) -> list[Post]:
-    """實際爬：全站搜尋（多關鍵詞合併去重）→ 時間預算內逐篇深挖內文+留言。
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity；長度為零就回 0（fail-safe）。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def _rerank_by_similarity(user_query: str, metas: list[dict[str, Any]],
+                          min_score: float) -> list[dict[str, Any]]:
+    """對搜尋結果依語意相關度過濾——避免 Dcard 全文檢索的部分匹配 fallback。
+
+    分數 = cosine(embed(user_query), embed(title + excerpt))；保留 >= min_score
+    並依分數重排。fail-safe：embed 失敗就回原 list（不擋爬蟲）。
+    批次一次 embed 所有 title+excerpt，只多一次 API call（~2s）。
+    """
+    if not metas or not (user_query or "").strip():
+        return metas
+    try:
+        query_vec = llm.embed(user_query)
+        texts = [
+            ((m.get("title") or "") + " " + (m.get("excerpt") or "")).strip() or "空"
+            for m in metas
+        ]
+        # 批次 embed：SDK 支援 input=list[str]，一次呼叫拿到所有向量
+        client = llm._client()  # noqa: SLF001 — 內部共用 client
+        resp = client.embeddings.create(model=settings.embed_model, input=texts)
+        vecs = [d.embedding for d in resp.data]
+    except Exception as e:  # noqa: BLE001 — 過濾失敗就沿用原結果，不擋整條爬蟲
+        log.warning("Dcard 語意過濾失敗（沿用原搜尋結果）：%s", e)
+        return metas
+
+    scored = [(m, _cosine(query_vec, v)) for m, v in zip(metas, vecs)]
+    kept = [(m, s) for m, s in scored if s >= min_score]
+    kept.sort(key=lambda x: x[1], reverse=True)
+    dropped = len(scored) - len(kept)
+    log.info("Dcard 語意過濾：%d 篇 → %d 篇（門檻 %.2f，丟 %d）",
+             len(scored), len(kept), min_score, dropped)
+    progress.emit("dcard_rerank", kept=len(kept), dropped=dropped,
+                  threshold=min_score, before=len(scored))
+    return [m for m, _ in kept]
+
+
+def _run(user_query: str, keywords: list[str], deep_max: int, deadline: float) -> list[Post]:
+    """實際爬：全站搜尋（多關鍵詞合併去重）→ 語意過濾（選配）→ 時間預算內逐篇深挖內文+留言。
 
     搜尋與逐篇深挖的迴圈頂端都設了取消檢查點：使用者按停止時，最多再等一篇貼文的時間。
     """
@@ -433,6 +477,12 @@ def _run(keywords: list[str], deep_max: int, deadline: float) -> list[Post]:
             seen.add(key)
             metas.append(m)
     progress.emit("crawl_search", platform="dcard", found=len(metas))
+
+    # 1.5) 語意過濾：把明顯不相關的（例如「幼兒園評價」對「福智教育園區評價」）擋掉。
+    # 用原始問句 embed vs 各篇 title+excerpt embed 的 cosine 相似度做重排 + 過濾。
+    if settings.dcard_live_rerank_enabled and metas:
+        metas = _rerank_by_similarity(user_query, metas, settings.dcard_live_min_score)
+        progress.emit("crawl_search", platform="dcard", found=len(metas))  # 更新前端顯示
 
     # 2) 逐篇深挖（時間預算內；到時間就回目前已抓到的）
     posts: list[Post] = []
@@ -469,7 +519,7 @@ def crawl(query: str, max_posts: int | None = None, time_budget: int | None = No
     log.info("Dcard 即時爬：keywords=%r deep_max=%d budget=%ds", keywords, deep_max, budget)
     with _lock:
         try:
-            return _run(keywords, deep_max, deadline)
+            return _run(query, keywords, deep_max, deadline)
         except Exception as e:  # noqa: BLE001 — live 爬蟲什麼都可能炸，一律 fail-safe
             # 取消（progress.Cancelled）是 BaseException，刻意不被這裡攔下：
             # 使用者按停止不該被當成「爬蟲掛了」而觸發一次沒必要的向量庫 fallback。

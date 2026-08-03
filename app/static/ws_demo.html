@@ -72,6 +72,16 @@
   .sources li { margin:6px 0; }
   .sources a { color:var(--accent); text-decoration:none; }
   .sources a:hover { text-decoration:underline; }
+  /* 追問建議：來源下方的可點 chips。點一下＝填入輸入框可改再送（不直接發問） */
+  .suggest { margin-top:14px; padding-top:12px; border-top:1px dashed var(--line); }
+  .suggest .hint { font-size:12px; color:var(--muted); margin-bottom:8px; }
+  .suggest .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .suggest button { font:inherit; font-size:13px; text-align:left; cursor:pointer;
+    color:var(--accent); background:var(--bg); border:1px solid var(--line);
+    border-radius:16px; padding:6px 14px; line-height:1.4;
+    transition:background .12s, border-color .12s; }
+  .suggest button:hover { background:var(--panel); border-color:var(--accent); }
+  .suggest button::before { content:"↳ "; color:var(--muted); }
 
   /* 立場分佈圖（stance_breakdown）：資料由後端「數」出來，這裡只負責畫 */
   .chart { margin-top:16px; border:1px solid var(--line); border-radius:10px;
@@ -242,15 +252,18 @@ function newTurn(question) {
   const sources = document.createElement("div");
   sources.className = "sources";
   sources.style.display = "none";
-  wrap.append(user, light, answer, chart, sources);
+  const suggest = document.createElement("div");
+  suggest.className = "suggest";
+  suggest.style.display = "none";
+  wrap.append(user, light, answer, chart, sources, suggest);
   $("chat").appendChild(wrap);
   $("chat").scrollTop = 1e9;
-  return { wrap, light, answer, chart, sources, text: "" };
+  return { wrap, light, answer, chart, sources, suggest, text: "" };
 }
 
 // 顯示順序固定；最後一組（空字串 key）收容未知平台，加平台時沒對應到就不會憑空消失
 const SOURCE_GROUPS = [
-  ["dcard", "📘 Dcard 及時爬"],
+  ["dcard", "📘 Dcard 即時爬"],
   ["ptt", "📗 PTT"],
   ["", "其他"],
 ];
@@ -291,6 +304,37 @@ function renderSources(box, list) {
     details.append(summary, ol);
     box.appendChild(details);
   }
+  box.style.display = "block";
+}
+
+/* 追問建議：把 ev.suggestions 畫成可點 chips。點一下＝把該題填進輸入框（可改再送），
+   不直接發問——使用者永遠能自己改字、或打全新問題。空陣列（產不出來）就整塊不顯示。 */
+function renderSuggestions(box, list) {
+  box.innerHTML = "";
+  box.style.display = "none";
+  if (!Array.isArray(list) || !list.length) return;
+
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.textContent = "想接著問？（點一下填進輸入框，可改再送）";
+  box.appendChild(hint);
+
+  const chips = document.createElement("div");
+  chips.className = "chips";
+  for (const q of list) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = q;                       // textContent：問題是模型產的，不當 HTML 解讀
+    b.addEventListener("click", () => {
+      const input = $("q");
+      input.value = q;                       // 填入、不送出
+      input.focus();
+      input.selectionStart = input.selectionEnd = input.value.length;  // 游標移到最後
+      input.scrollIntoView({ block: "nearest" });
+    });
+    chips.appendChild(b);
+  }
+  box.appendChild(chips);
   box.style.display = "block";
 }
 
@@ -492,6 +536,17 @@ function connect() {
 function handle(ev) {
   switch (ev.type) {
     case "stage":       log("● " + ev.text); break;
+
+    // 記憶生效的證據：脈絡注入後刻意退居背景（答案仍以本次爬到的最新討論為準），
+    // 光看答案分不出有沒有載到 → 這行只報「載了什麼」，不影響答案本身。
+    case "memory_loaded": {
+      const parts = [];
+      if (ev.facts)   parts.push(ev.meta ? `全部記憶 ${ev.facts} 則` : `使用者事實 ${ev.facts} 則`);
+      if (ev.threads) parts.push(`相關舊對話脈絡 ${ev.threads} 則`);
+      log("◆ 已載入記憶：" + parts.join(" · "), "dim");
+      break;
+    }
+
     case "search_start": log(`▶ 並行查詢：${ev.platforms.join(" + ")}`, "dim"); break;
 
     case "crawl_plan":
@@ -548,6 +603,7 @@ function handle(ev) {
     case "done":
       setLight(turn.light, ev.light === "green");
       renderSources(turn.sources, ev.sources);
+      renderSuggestions(turn.suggest, ev.suggestions);  // 來源下方的追問建議（fail-safe：空就不顯示）
       // 圖通常已由 chart 事件畫好；沒畫到才補（例如事件掉了）。不重畫，免得閃一下。
       if (ev.chart && turn.chart.style.display === "none") renderChart(turn.chart, ev.chart);
       chatHistory.push({ role: "user", content: turn.question });
@@ -581,6 +637,9 @@ async function ask() {
   $("log").innerHTML = "";
   for (const k in progressLines) delete progressLines[k];
   log("? " + question, "dim");
+
+  // 新一輪開始：清掉上一輪的追問建議，避免堆疊、也避免點到過期的建議
+  if (turn && turn.suggest) { turn.suggest.style.display = "none"; turn.suggest.innerHTML = ""; }
 
   turn = newTurn(question);
   turn.question = question;
