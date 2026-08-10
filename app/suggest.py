@@ -13,8 +13,10 @@ from __future__ import annotations
 import logging
 import re
 
+from . import tracing
 from .config import settings
 from .llm import chat
+from .tracing import observe
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,7 @@ _MAX_CHARS = 30  # 提示模型的單題長度上限（chip 太長會爆版，�
 _LEAD = re.compile(r"^\s*(?:\d+[.、)）]\s*|[-•·]\s*)")  # 去掉模型可能加的編號/項目符號
 
 
+@observe(name="suggest_followups", capture_input=False)
 def suggest_followups(question: str, answer: str,
                       sources: list[dict] | None = None,
                       n: int | None = None,
@@ -47,6 +50,11 @@ def suggest_followups(question: str, answer: str,
 
     facts = [str(m).strip() for m in (memories or []) if str(m).strip()]
     personalize = bool(facts) and settings.suggest_personalize
+    # capture_input 關掉、改在這裡挑欄位記：自動擷取會把 memories 原文（使用者的個人事實）
+    # 抄進 span。那些內容在 build_context 的 system prompt 裡已經有一份，沒必要再散一份到
+    # 這裡；只記「有沒有個人化、吃了幾條」就夠診斷了。
+    tracing.set_span(input={"question": question},
+                     metadata={"personalize": personalize, "facts": len(facts), "n": n})
     if personalize:
         context += ("\n\n關於這位使用者（僅供你挑選面向，不可寫進問題文字）：\n"
                     + "\n".join(f"- {f}" for f in facts))

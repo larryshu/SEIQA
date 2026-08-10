@@ -4,7 +4,8 @@
 某平台包成統一的 `fetch(query) -> list[Post]`（Post 已帶 source 平台標籤）。查詢時並行 fan-out
 到所有 adapter、合併結果。
 
-擴充新平台＝在這裡多寫一個 Source、加進 _ADAPTERS 即可——agent / loop / prompt 全部不用動。
+擴充新平台＝在這裡多寫一個 Source、加進 _ADAPTERS 即可——agent / loop / prompt 全部不用動
+（platform 名稱不寫死在 prompt 與 tools 裡，見 SearchResult.platforms）。
 
 M3：啟用哪些平台、各平台參數（top_k / min_score / expand_n / PTT 預算）改由後台 MySQL 決定
 （config_repo）。後台沒設或 DB 連不上時 fall back 到 _DEFAULT_REGISTRY 與 .env（settings）。
@@ -17,11 +18,13 @@ import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from typing import NamedTuple
 
-from . import llm, progress, ptt, vectorstore
+from . import llm, progress, ptt, tracing, vectorstore
 from .config import settings
 from .config_repo import repo
 from .crawler import Post
+from .tracing import observe
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +36,18 @@ class Source(ABC):
     """一個社群來源 adapter。name 用於日誌；fetch 回傳已帶 source 標籤的 Post 清單。
 
     cfg：後台該平台的 source_config（已 typed）；取不到的 key 一律 fall back 到 settings。
+    label：後台 source_platform.display_name（給 LLM 看的中文平台名）；沒設就用 PLATFORM_LABELS。
     """
 
     name: str
 
-    def __init__(self, cfg: dict | None = None) -> None:
+    def __init__(self, cfg: dict | None = None, label: str = "") -> None:
         self.cfg = cfg or {}
+        self._label = label
+
+    @property
+    def label(self) -> str:
+        return self._label or PLATFORM_LABELS.get(self.name, self.name)
 
     @abstractmethod
     def fetch(self, query: str) -> list[Post]:
@@ -70,9 +79,9 @@ class DcardLiveSource(Source):
 
     name = "dcard"
 
-    def __init__(self, cfg: dict | None = None) -> None:
-        super().__init__(cfg)
-        self._vector = DcardSource(cfg)  # fallback
+    def __init__(self, cfg: dict | None = None, label: str = "") -> None:
+        super().__init__(cfg, label)
+        self._vector = DcardSource(cfg, label)  # fallback
 
     def fetch(self, query: str) -> list[Post]:
         from . import dcard_live  # lazy：DrissionPage 沒裝也不影響 app 啟動
@@ -98,6 +107,20 @@ class PttSource(Source):
         return ptt.search(query, time_budget=time_budget)
 
 
+class ThreadsSource(Source):
+    """Threads：免登入讀 SSR JSON 的即時爬（純 httpx，不必開瀏覽器）。
+
+    平台限制與對策全在 threads.py 的模組 docstring；這裡只負責把後台參數接進去。
+    """
+
+    name = "threads"
+
+    def fetch(self, query: str) -> list[Post]:
+        from . import threads  # lazy：與其他 adapter 一致，import 失敗不影響 app 啟動
+        time_budget = int(self.cfg.get("time_budget", settings.threads_time_budget))
+        return threads.search(query, time_budget=time_budget)
+
+
 def _dcard_cls() -> type[Source]:
     """DCARD_MODE 決定 Dcard 這條走哪個 adapter：live=即時爬（+向量 fallback）｜vector=純向量庫。"""
     return DcardLiveSource if settings.dcard_mode == "live" else DcardSource
@@ -109,10 +132,19 @@ _ADAPTERS: dict[str, type[Source]] = {
     "dcard": _dcard_cls(),
     "dcard_vector": DcardSource,
     "ptt": PttSource,
+    "threads": ThreadsSource,
+}
+
+# 平台標籤（給 LLM 看的中文名）。runtime 這側的單一來源，tools.py 由此組來源標註；
+# 後台有設 display_name 時以後台為準（見 _build_registry）。
+PLATFORM_LABELS: dict[str, str] = {
+    "dcard": "Dcard",
+    "ptt": "PTT",
+    "threads": "Threads",
 }
 
 # fallback：後台不可用時用的預設（等同 M3 之前的寫死 registry）
-_DEFAULT_REGISTRY: list[Source] = [_dcard_cls()(), PttSource()]
+_DEFAULT_REGISTRY: list[Source] = [_dcard_cls()(), PttSource(), ThreadsSource()]
 
 # 對外相容：保留 REGISTRY 名稱（指向預設）
 REGISTRY: list[Source] = _DEFAULT_REGISTRY
@@ -142,15 +174,21 @@ def _build_registry(end_user_id: int | None = None) -> list[Source]:
             continue
         cls = _ADAPTERS.get(s.get("adapter_key", ""))
         if cls:
-            built.append(cls(s.get("configs")))
+            built.append(cls(s.get("configs"), s.get("display_name") or ""))
     return built
 
 
+@observe(as_type="retriever", capture_input=False, capture_output=False)
 def _safe_fetch(source: Source, query: str) -> list[Post]:
     """單一來源 fail-safe：任一平台炸掉只少那一邊，不影響其他來源。
 
     注意：下面的 except Exception 不會攔到 progress.Cancelled（它繼承 BaseException），
     取消因此不會被誤記成「這個平台掛了」而回空清單。
+
+    這支跑在 fan-out 的 worker thread 裡，但 span 仍會正確掛在父節點下——因為
+    community_search 是用 `contextvars.copy_context().run` 送進執行緒的，而 OTel 的
+    context 傳播正是走 contextvars（原本這樣寫是為了讓 progress.emit 與取消檢查看得到
+    訂閱者，剛好把埋點需要的東西一起帶進去了）。改動那裡時要留意會連帶影響 trace 樹。
     """
     progress.emit("source_start", platform=source.name)
     started = time.monotonic()
@@ -159,13 +197,32 @@ def _safe_fetch(source: Source, query: str) -> list[Post]:
     except Exception as e:  # noqa: BLE001
         logger.warning("%s fetch failed, skipped: %s", source.name, e)
         progress.emit("source_error", platform=source.name, message=str(e))
+        tracing.set_span(name=source.name, input=query, level="WARNING", status_message=str(e),
+                         output={"posts": 0, "elapsed": round(time.monotonic() - started, 1)})
         return []
-    progress.emit("source_done", platform=source.name, count=len(posts),
-                  elapsed=round(time.monotonic() - started, 1))
+    elapsed = round(time.monotonic() - started, 1)
+    progress.emit("source_done", platform=source.name, count=len(posts), elapsed=elapsed)
+    # 只記則數與耗時，不記貼文全文：同一批貼文最後會完整出現在 community_search 的
+    # tool span 輸出裡（就是餵給 LLM 的那份），這裡再記一次是純粹的重複。
+    tracing.set_span(name=source.name, input=query,
+                     output={"posts": len(posts), "elapsed": elapsed})
     return posts
 
 
-def community_search(query: str, end_user_id: int | None = None) -> list[Post]:
+class SearchResult(NamedTuple):
+    """fan-out 的結果。
+
+    platforms 是「本輪實際跑過哪些來源」（(name, label) 配對、順序即合併順序）——呼叫端要
+    據此告訴 LLM 哪些平台有／沒有撈到資料。這件事一定要由這裡回報，不能在呼叫端寫死平台
+    清單：啟用哪些平台是後台與使用者偏好決定的，寫死的話新增平台永遠不會出現在提示裡。
+    """
+
+    posts: list[Post]
+    platforms: list[tuple[str, str]]
+
+
+@observe(name="fanout", capture_input=False, capture_output=False)
+def community_search(query: str, end_user_id: int | None = None) -> SearchResult:
     """並行 fan-out 到所有啟用來源（套使用者平台偏好），依順序合併（每篇已帶 source 平台標籤）。"""
     registry = _build_registry(end_user_id)
     progress.emit("search_start", query=query, platforms=[s.name for s in registry])
@@ -196,4 +253,8 @@ def community_search(query: str, end_user_id: int | None = None) -> list[Post]:
         platform = post.get("source", "?")
         counts[platform] = counts.get(platform, 0) + 1
     progress.emit("search_done", total=len(results), counts=counts)
-    return results
+    # 每個平台各撈到幾則，是判斷「哪一邊該調門檻」最直接的數字（某平台長期回 0
+    # 通常不是沒討論，而是抽詞或語意門檻的問題）。
+    tracing.set_span(input=query, output={"total": len(results), "counts": counts},
+                     metadata={"platforms": [s.name for s in registry]})
+    return SearchResult(results, [(s.name, s.label) for s in registry])

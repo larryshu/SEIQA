@@ -127,7 +127,8 @@ def _auth_dialog() -> None:
 st.set_page_config(page_title="社群輿情智能問答", page_icon="📊")
 st.title("📊 社群輿情智能問答 — 社群口碑")
 st.caption("問鄉民口碑/時事類問題")
-# Agent 會『同時』查 Dcard 口碑庫與即時爬 PTT、綜合兩邊回答；都沒有就用既有常識答。
+# Agent 會『同時』即時爬所有啟用的社群平台（Dcard / PTT / Threads）、綜合各邊回答；
+# 都沒有就用既有常識答。
 # ── 狀態：sid 放網址(query param) → F5 重整網址不變、sid 不變 ──
 sid = st.query_params.get("sid")
 if not sid:
@@ -199,18 +200,33 @@ def _render_answer(text: str) -> None:
     st.write(text.replace("~", "～"))
 
 
+# 平台顯示名（順序＝畫面上的顯示順序）；最後的空字串 key 收容未知平台，
+# 加平台時沒對應到也不會憑空消失。與 app/static/ws_demo.html 的 SOURCE_GROUPS 同一份設定。
+_PLATFORMS: list[tuple[str, str]] = [
+    ("dcard", "📘 Dcard 及時爬"),
+    ("ptt", "📗 PTT"),
+    ("threads", "🧵 Threads"),
+    ("", "其他"),
+]
+
+
+def _group_by_platform(sources: list) -> dict[str, list]:
+    """依 source 分組，保留每筆在完整清單裡的序號（那個號碼要對得上答案內文的 [n]）。"""
+    groups: dict[str, list] = {key: [] for key, _ in _PLATFORMS}
+    for i, s in enumerate(sources):
+        key = s.get("source", "")
+        groups[key if key in groups else ""].append((i + 1, s))
+    return groups
+
+
 def _answer_caption(sources: list) -> None:
     """燈號＝這次回答的來源：有撈到社群討論→綠燈（標各平台則數）；否則→黃燈（LLM 既有常識）。"""
     if not sources:
-        st.caption("🟡 LLM 既有常識回答（Dcard / PTT 都沒有相關討論）")
+        st.caption("🟡 LLM 既有常識回答（社群平台上都沒有相關討論）")
         return
-    n_dcard = sum(1 for s in sources if s.get("source") == "dcard")
-    n_ptt = sum(1 for s in sources if s.get("source") == "ptt")
-    parts = []
-    if n_dcard:
-        parts.append(f"Dcard 及時爬 {n_dcard} 則")
-    if n_ptt:
-        parts.append(f"PTT {n_ptt} 則")
+    groups = _group_by_platform(sources)
+    parts = [f"{label.split(' ', 1)[-1]} {len(groups[key])} 則"
+             for key, label in _PLATFORMS if groups[key]]
     st.caption("🟢 來自社群討論：" + ("、".join(parts) or f"{len(sources)} 則"))
 
 
@@ -218,18 +234,12 @@ def _render_sources(sources: list) -> None:
     """來源依平台分組，做成『預設收合』的 expander（點標題才展開）；保留全域編號＝答案裡的 [n]。"""
     if not sources:
         return
-    groups: dict[str, list] = {"dcard": [], "ptt": []}
-    other: list = []
-    for i, s in enumerate(sources):
-        if not s.get("url"):
-            continue
-        line = f"{i + 1}. [{s.get('title') or s.get('url')}]({s['url']})"
-        groups.get(s.get("source", ""), other).append(line)
+    groups = _group_by_platform(sources)
 
     st.markdown("**來源：**")
-    for label, lines in (("📘 Dcard 及時爬", groups["dcard"]),
-                         ("📗 PTT", groups["ptt"]),
-                         ("其他", other)):
+    for key, label in _PLATFORMS:
+        lines = [f"{n}. [{s.get('title') or s['url']}]({s['url']})"
+                 for n, s in groups[key] if s.get("url")]
         if lines:
             with st.expander(f"{label}（{len(lines)}）", expanded=False):  # 預設收合
                 st.markdown("\n".join(lines))

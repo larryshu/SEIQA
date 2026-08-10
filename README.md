@@ -32,17 +32,18 @@
 tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LLM 用 tool calling 自己決定何時呼叫外部工具」的模式，但用既有 Azure OpenAI 技術棧原生實作（不引入 Hermes 平台）。
 
 > 你問「遠距離戀愛可以維持嗎？」→ Agent 判斷需要鄉民口碑 → 呼叫 `community_search` →
-> **同時即時爬 Dcard（DrissionPage 過 Cloudflare）＋ PTT** → 綜合兩邊、帶分平台出處回答。（Dcard 即時爬失敗自動退回向量庫 fallback）
+> **同時即時爬 Dcard（DrissionPage 過 Cloudflare）＋ PTT ＋ Threads** → 綜合各邊、帶分平台出處回答。（Dcard 即時爬失敗自動退回向量庫 fallback）
 > 問「一年有幾個月？」→ 判斷不需查 → 直接用常識回答（🟡 黃燈）。
 
 ### 技術亮點
 
 - **原生 tool-calling Agent**：不靠框架，LLM 自行規劃是否查、查什麼；**兩個 skill —— `community_search`（查）與 `stance_breakdown`（算）**，一個對外查詢、內部並行 fan-out 多平台，一個把撈到的討論統計成可畫圖的分佈。
 - **統計不交給 LLM（`stance_breakdown` + 圖表）**：直接問模型「大概幾成？」它會回「六四開」——那個數字沒有人數過。所以拆成 **LLM 只做逐則分類、Python 用 `Counter` 加總**；每一片圓餅都帶 `[n]` 回得去原文，樣本 < 8 則只秀則數不秀百分比。圖由前端手刻 SVG 畫（零前端相依），**prompt 明令模型不准自己估比例、不准用文字符號拼圖表**。
-- **雙來源即時爬 + 反爬**：**Dcard 用 DrissionPage 驅動真實 Chrome 過 Cloudflare 即時爬**、PTT 用 requests 即時爬，**「兩邊都查」是程式層保證**；Dcard 另備離線向量庫當 fallback（即時爬失敗自動退回）。
+- **三來源即時爬 + 反爬**：**Dcard 用 DrissionPage 驅動真實 Chrome 過 Cloudflare 即時爬**、PTT 用 requests 即時爬、**Threads 用 crawler UA 讀 SSR JSON 免登入爬**，**「每一邊都查」是程式層保證**；Dcard 另備離線向量庫當 fallback（即時爬失敗自動退回）。
+- **相關性過濾是分層的、且門檻是量出來的**：三個平台的站內搜尋都不是語意搜尋，各有各的失準方式，故共用一層 `relevance.py`（embed cosine 重排）＋各自的字面規則。門檻不憑感覺設——實測「輝達進駐北士科」在 PTT 是 最高 0.448／中位 0.356，在 Threads 是 最高 0.407／中位 0.278，**沿用直覺的 0.5 會兩個平台都回 0 篇**。
 - **Registry + adapter 擴充性**：加平台＝多寫一個 adapter，agent / prompt / loop 全不動；連 Dcard 的「即時爬↔向量庫」切換也靠這層乾淨接起來（`DCARD_MODE`）。
 - **設定資料庫化**：prompt / 模型 / 平台開關 / 檢索門檻全搬進 MySQL，後台改設定**免改程式碼**；runtime 唯讀讀取 + 短 TTL 快取。
-- **全域 fail-safe（分層）**：Dcard 即時爬掛了退向量庫、PTT 掛了只少 PTT、任一來源 embed/Qdrant/後台 DB 出事只降級不中斷；兩邊都空 → 誠實退回常識（🟡 黃燈），反幻覺。
+- **全域 fail-safe（分層）**：Dcard 即時爬掛了退向量庫、PTT / Threads 掛了只少那一邊、任一來源 embed/Qdrant/後台 DB 出事只降級不中斷；全部都空 → 誠實退回常識（🟡 黃燈），反幻覺。
 - **WebSocket 即時前端**：`/ws/ask` 把 agent 的每一步（抽關鍵字、深挖第幾篇、**退回 fallback**）即時推給前端、答案逐字串流，並支援生成中取消。事件匯流排用 `contextvars` 實作，**`/ask` 與 Streamlit 行為完全不變**（見 [§3.3](#33-即時進度串流與取消websocketwsask)）。
 - **三層記憶（長期層雙軌）+ 偏好自動推論**：短期檢索快取、中期對話落地、長期使用者記憶（**事實點狀召回 ＋ 脈絡敘事重載 / episodic 雙軌**）；登出時 LLM 另從對話**自動學習可執行偏好**（白名單 + 保守門檻 + 不覆寫人工設定）。
 - **完整後台**：四模組（agent / 帳戶 / 記憶 / 偏好）、RBAC（admin/editor/viewer）、稽核、JWT 雙身分（操作者 vs 終端使用者）；認證端點限流、輸入一律走 serializer 驗證、`/api/docs/` 有由 code 產生的 Swagger。
@@ -100,6 +101,7 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 | `DcardLiveSource` | Dcard | **DrissionPage 即時爬**：LLM 抽關鍵字 → 全站「文章」搜尋 → 時間預算內深挖內文/留言；失敗→退回向量庫 | Cloudflare：DrissionPage 驅動真實 Chrome + 持久設定檔養 `cf_clearance` |
 | `DcardSource` | Dcard（fallback） | 查向量庫 `dcard_insight`（語意檢索，唯讀）；`DCARD_MODE=vector` 也可強制走這條 | 無（離線已建庫） |
 | `PttSource` | PTT | 即時爬站內搜尋（時間預算內邊翻邊抓） | 無 Cloudflare，帶 `over18` cookie 即可 |
+| `ThreadsSource` | Threads | **免登入即時爬**：LLM 抽核心實體 → 各單詞搜一次合併 → 語言/字面/語意三層過濾 → 展開熱門篇回覆串 | crawler UA 才拿得到 SSR payload（一般 UA 只有空殼）；純 httpx，不必開瀏覽器 |
 
 > **Dcard 的演進**：一開始因站內搜尋被 Cloudflare 擋，改用離線向量庫（穩定、唯讀）；後來用 DrissionPage 攻克 Cloudflare、升級成即時爬拿最新討論，**向量庫保留當 fallback**。`DCARD_MODE=live`（預設，即時爬＋fallback）／`vector`（純向量庫）。
 
@@ -107,14 +109,15 @@ tool-calling 的**多平台社群口碑問答 Agent**。借鑑 Hermes Agent「LL
 
 - **Dcard＝即時爬（DrissionPage）＋向量庫 fallback**：LLM 先把問句抽成關鍵字（不用選版），開全站「文章」搜尋 `/search/posts`；貼文改用 `globalPaging` 端點載入（自行重放會 403），故用 `page.listen` 攔截網頁自己發的回應。搜回相關文後，在 `DCARD_TIME_BUDGET`（預設 100s）內逐篇進頁抓內文＋熱門留言，到時就停、回已抓到的（單例瀏覽器 + 鎖、留言掃描上限控成本）。**即時爬失敗/沒結果 → 自動退回向量庫**（`dcard_insight` 3529 筆、多面向查詢改寫 `SEARCH_EXPAND_N` + round-robin + `SEARCH_MIN_SCORE` 門檻，避免單一稠密向量被強勢詞綁架）。
 - **PTT＝即時爬＋時間預算**：LLM 一次決定（看板 + 多個『單一關鍵詞』）——PTT 多詞是 AND 比對標題（「外型 情緒穩定」→ 0 筆），故抽成多個單詞各搜再合併。翻搜尋頁『邊翻邊抓』，到 `PTT_TIME_BUDGET`（預設 60s）就停；全程禮貌限速避免被 ban。
+- **Threads＝免登入 SSR + 三層過濾**：一般瀏覽器 UA 只拿得到空殼（內容靠前端 GraphQL 補），**crawler UA 才會吐出含 `thread_items` 的 SSR JSON**，搜尋頁與貼文頁結構相同故共用一個 parser。三個實測出來的平台特性決定了作法：**(1) 搜尋只吃單一詞**——任何含空白的 query 一律 0 筆（`+` 或 `%20` 都一樣，連「台灣 美食」都 0），`AI越獄` 也 0 筆而 `越獄` 51 筆，所以查不到「A 且 B」的交集，只能拆單詞各搜再合併；**(2) 沒有地區過濾**——搜 `OpenAI` 回 49 筆裡 `zh_TW` 只有 1 筆（搜 `輝達` 則 41/51），故自建語言過濾，且 `lang` 欄位 49 篇有 47 篇從缺、要用漢字/假名/諺文字元兜底；**(3) 因此 Threads 是「實體驅動」平台**——核心是專有名詞（慈濟、輝達）時表現好，是組合概念（AI 越獄 ∩ 資安）時幾乎撈不到。對策是抽詞時就請 LLM 標記每個詞是不是**具體實體**：非實體詞照樣拿去搜以擴大召回，但**只命中它的貼文不採信**——問「OpenAI 越獄」時只中「越獄」的是貓咪跑出籠、越獄風雲影集、電視盒刷機，字面與語意過濾都擋不住，只有「這篇有沒有提到 OpenAI」問得出真相。回覆串折進主文的 `content`（比照 PTT 熱門推文），**粒度與其他平台對齊**，前端與立場統計都不必特別處理。
 - **檢索快取＝方案 A（預設）**：查到的社群資料只進**當次 session 記憶體**（`SessionFreshStore`），用完即丟。業務只認 `FreshStore` 抽象。
 - **燈號＝來源透明**：有撈到社群討論 → 🟢 綠燈＋標各平台則數＋來源 `[n]`；都沒撈到（或不需查）→ 🟡 黃燈，誠實標為 LLM 既有常識。
-- **fail-safe（分層）**：Dcard 即時爬失敗自動退向量庫；PTT 失敗只少 PTT；任一平台 embed/Qdrant 出事只影響那一邊；兩邊都空就退回常識回答。
+- **fail-safe（分層）**：Dcard 即時爬失敗自動退向量庫；PTT / Threads 失敗只少那一邊；任一平台 embed/Qdrant 出事只影響那一邊；全部都空就退回常識回答。
 - **工具＝skill**：`tools.py` 的 `description` 寫清楚「何時該用」＝觸發條件，等同 Hermes skill 的 trigger。
 
 ### 3.3 即時進度、串流與取消（WebSocket，`/ws/ask`）
 
-`/ask` 是阻塞請求：Dcard 時間預算 100s、PTT 60s（並行），最壞情況使用者盯著 spinner 等近兩分鐘、毫無回饋。`/ws/ask` 就是為了解決這件事，而 `/ask` 原封不動保留。
+`/ask` 是阻塞請求：Dcard 時間預算 100s、PTT 60s、Threads 90s（並行），最壞情況使用者盯著 spinner 等近兩分鐘、毫無回饋。`/ws/ask` 就是為了解決這件事，而 `/ask` 原封不動保留。
 
 - **事件匯流排 `app/progress.py`**：用 `contextvars` 傳遞 emitter 與取消號誌，而不是改函式簽章——所以 `Source.fetch()` 介面不變，README 承諾的「加平台＝只寫一個 adapter」依然成立。**沒有訂閱者時 `emit()` 是 no-op**，`/ask` 行為一個位元都沒變。fan-out 的每個 future 各複製一份 `Context`（同一個 `Context` 不能被兩條執行緒同時 `run`）。
 - **事件流**：`stage` → `crawl_plan` → `crawl_search` → `crawl_progress`（就地更新）→ `source_fallback` / `source_error` → `source_done` → `search_done` →（若有統計）`stance_progress` → `chart` → `token`（逐字）→ `done` / `cancelled` / `error`。其中 **`source_fallback` 讓原本只寫進後端 log 的分層降級，變成使用者看得見的產品行為**；`chart` 則讓圖在模型還沒開口前就先畫出來。
@@ -329,7 +332,7 @@ erDiagram
 | `agent.py` `SYSTEM_PROMPT` / `MAX_TOOL_ROUNDS` | `agent`（`is_active=1`） |
 | `tools.py` `TOOLS` | `skill` + `agent_skill` |
 | `sources.py` `REGISTRY` 啟用與順序 | `source_platform` |
-| 各檢索參數（top_k / min_score / expand_n / PTT 預算） | `source_config` |
+| 各檢索參數（top_k / min_score / expand_n / PTT・Threads 預算） | `source_config` |
 | `config.py` 業務設定（model / 門檻 / 逾時） | `system_setting` |
 | 每使用者語氣 / 平台過濾 / 答案長度 | `user_preference` |
 
@@ -356,12 +359,14 @@ GRANT SELECT, INSERT, UPDATE ON <db>.user_preference  TO 'crawl_rw'@'<host>';
 ```
 SEIQA/
 ├─ app/                     # FastAPI runtime（agent + 唯讀 MySQL 讀取層）
-│   config.py               # .env 設定（LLM / Qdrant / Dcard 即時爬 / PTT / MySQL / 記憶 / 偏好）
+│   config.py               # .env 設定（LLM / Qdrant / Dcard 即時爬 / PTT / Threads / MySQL / 記憶 / 偏好）
 │   llm.py                  # LLM 客戶端：chat() / chat_with_tools() / embed() / expand_queries()
 │   dcard_live.py           # Dcard 即時爬（DrissionPage 過 Cloudflare：全站文章搜尋 + 深挖內文/留言 + 時間預算）
 │   vectorstore.py          # Dcard fallback 向量檢索（Qdrant REST，多面向 + 門檻；即時爬失敗時用）
 │   ptt.py                  # PTT 即時爬蟲（requests + bs4，over18 + 時間預算 + 限速 + 重試）
-│   sources.py              # 來源 registry：Source 抽象 + DcardLiveSource(→向量 fallback)/PttSource + 並行 fan-out
+│   threads.py              # Threads 即時爬蟲（httpx 讀 SSR JSON，免登入；單詞搜尋 + 語言/字面/語意過濾 + 展開回覆串）
+│   relevance.py            # 三平台共用的相關性層：泛用詞停用表 + embed cosine 重排過濾
+│   sources.py              # 來源 registry：Source 抽象 + DcardLiveSource(→向量 fallback)/PttSource/ThreadsSource + 並行 fan-out
 │   store.py                # FreshStore 抽象 + SessionFreshStore(A) + QdrantHotStore(B 預留)；all() 供追問回讀
 │   tools.py                # 兩個 skill：community_search（查）+ stance_breakdown（算）
 │   stance.py               # 立場統計：LLM 逐則分類 → Python Counter 加總（LLM 不估比例、不畫圖）
@@ -389,7 +394,7 @@ SEIQA/
 **前置**：
 - **Dcard 即時爬（`DCARD_MODE=live`，預設）**：本機裝有 Google Chrome；設 `DCARD_USER_DATA_DIR` 持久設定檔養 `cf_clearance` 過 Cloudflare（首次可能需在彈出視窗手動點一次盾）。需有桌面環境（有頭瀏覽器）。
 - **Dcard fallback / `DCARD_MODE=vector`**：Qdrant 跑著、`dcard_insight` 已有資料、`EMBED_MODEL` 與建庫時同一模型（`text-embedding-3-small`，1536 維）。
-- PTT 免設定。
+- PTT、Threads 免設定（都不需要帳號或憑證；Threads 純讀公開頁的 SSR JSON）。
 
 **只跑問答 runtime（最小；不需 MySQL / 後台）**
 
@@ -440,7 +445,9 @@ python -m venv .venv-admin
 .venv-admin\Scripts\python.exe admin_backend\manage.py test accounts.tests.ThrottleTests
 ```
 
-**手動驗證 runtime**：Swagger UI（http://localhost:8001/docs，注意 WebSocket 不會出現在 OpenAPI）／ curl `POST /ask` ／ 兩個前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則」或「🟡 LLM 既有常識」。兩來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET)` 秒（非相加）——這也正是 `/demo` 要即時推進度的原因。
+**手動驗證 runtime**：Swagger UI（http://localhost:8001/docs，注意 WebSocket 不會出現在 OpenAPI）／ curl `POST /ask` ／ 兩個前端。回覆上方標「🟢 Dcard 及時爬 X 則 / PTT Y 則 / Threads Z 則」或「🟡 LLM 既有常識」。三來源並行，一題最久 ≈ `max(DCARD_TIME_BUDGET, PTT_TIME_BUDGET, THREADS_TIME_BUDGET)` 秒（非相加）——這也正是 `/demo` 要即時推進度的原因。
+
+> **Threads 的驗收題要挑對**：它是實體驅動的，用「慈濟最近的爭議」「輝達進駐北士科」這種帶專有名詞的題目才看得出價值；問「OpenAI 越獄的資安問題」它會誠實回 0 篇（該議題的中文討論不在 Threads 上），此時答案就只根據 Dcard / PTT 講。
 
 ---
 
@@ -464,6 +471,18 @@ DCARD_USER_DATA_DIR=...              # 持久 Chrome 設定檔：養 cf_clearanc
 SEARCH_TOP_K=5 / SEARCH_EXPAND_N=3 / SEARCH_MIN_SCORE=0.5   # 則數 / 改寫條數 / 門檻
 PTT_TIME_BUDGET=60                   # PTT 即時爬時間預算（秒）
 PTT_MIN_DELAY=0.5 / PTT_MAX_DELAY=1.0  # PTT 禮貌限速
+PTT_MIN_SCORE=0.30                   # PTT 語意過濾門檻（實測值，勿沿用 0.5：會回 0 篇）
+
+# --- Threads 即時爬（免登入，讀 SSR JSON）---
+THREADS_TIME_BUDGET=90               # 時間預算（秒）；三平台並行取 max()，不會加到等待時間上
+THREADS_MODE=broad                   # broad（~60 筆/近三週）｜recent（~20 筆/最近 1~2 天）
+THREADS_EXPAND_MAX=10                # 最多展開幾篇的回覆串（上限，非保證）
+THREADS_MIN_REPLIES=1                # 至少幾則回覆才值得展開
+THREADS_MAX_REPLIES=15               # 每篇取前幾則回覆（依讚數）
+THREADS_STRICT=true                  # 本文須含「具體實體」關鍵詞才採信
+THREADS_LANG_FILTER=true             # 濾非中文（Threads 搜尋是全球的，沒有地區過濾）
+THREADS_MIN_SCORE=0.30               # 語意過濾門檻（貼文短，分數天生偏低）
+THREADS_MIN_INTERVAL=1.5 / THREADS_JITTER=1.0  # 禮貌限速（不帶憑證，最壞是 IP 限流）
 
 # --- 個人化長期記憶：事實（僅登入者；fail-safe）---
 USER_MEMORY_ENABLED=true / USER_MEMORY_COLLECTION=user_memory

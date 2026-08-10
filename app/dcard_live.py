@@ -16,7 +16,6 @@ from __future__ import annotations
 import atexit
 import json
 import logging
-import math
 import random
 import re
 import threading
@@ -25,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 from urllib.parse import quote
 
-from . import llm, progress
+from . import llm, progress, relevance
 from .config import settings
 from .crawler import Post
 
@@ -413,47 +412,18 @@ def _to_post(meta: dict[str, Any], full: dict[str, Any] | None,
     )
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    """Cosine similarity；長度為零就回 0（fail-safe）。"""
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    return dot / (na * nb) if na and nb else 0.0
-
-
 def _rerank_by_similarity(user_query: str, metas: list[dict[str, Any]],
                           min_score: float) -> list[dict[str, Any]]:
     """對搜尋結果依語意相關度過濾——避免 Dcard 全文檢索的部分匹配 fallback。
 
-    分數 = cosine(embed(user_query), embed(title + excerpt))；保留 >= min_score
-    並依分數重排。fail-safe：embed 失敗就回原 list（不擋爬蟲）。
-    批次一次 embed 所有 title+excerpt，只多一次 API call（~2s）。
+    實作在 relevance.rerank（三個平台共用）；這裡只決定「拿哪段文字去比對」：
+    搜尋結果頁的 title + excerpt（此時還沒進頁，拿得到的就這些）。
     """
-    if not metas or not (user_query or "").strip():
-        return metas
-    try:
-        query_vec = llm.embed(user_query)
-        texts = [
-            ((m.get("title") or "") + " " + (m.get("excerpt") or "")).strip() or "空"
-            for m in metas
-        ]
-        # 批次 embed：SDK 支援 input=list[str]，一次呼叫拿到所有向量
-        client = llm._client()  # noqa: SLF001 — 內部共用 client
-        resp = client.embeddings.create(model=settings.embed_model, input=texts)
-        vecs = [d.embedding for d in resp.data]
-    except Exception as e:  # noqa: BLE001 — 過濾失敗就沿用原結果，不擋整條爬蟲
-        log.warning("Dcard 語意過濾失敗（沿用原搜尋結果）：%s", e)
-        return metas
-
-    scored = [(m, _cosine(query_vec, v)) for m, v in zip(metas, vecs)]
-    kept = [(m, s) for m, s in scored if s >= min_score]
-    kept.sort(key=lambda x: x[1], reverse=True)
-    dropped = len(scored) - len(kept)
-    log.info("Dcard 語意過濾：%d 篇 → %d 篇（門檻 %.2f，丟 %d）",
-             len(scored), len(kept), min_score, dropped)
-    progress.emit("dcard_rerank", kept=len(kept), dropped=dropped,
-                  threshold=min_score, before=len(scored))
-    return [m for m, _ in kept]
+    return relevance.rerank(
+        user_query, metas, min_score,
+        lambda m: (m.get("title") or "") + " " + (m.get("excerpt") or ""),
+        platform="dcard",
+    )
 
 
 def _run(user_query: str, keywords: list[str], deep_max: int, deadline: float) -> list[Post]:

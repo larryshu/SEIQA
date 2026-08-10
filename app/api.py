@@ -17,11 +17,13 @@ from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import agent, dcard_live, memory_store, progress, suggest, user_memory, user_preference
+from . import (agent, audit, dcard_live, memory_store, progress, suggest, tracing, user_memory,
+               user_preference)
 from .agent import run
 from .auth import end_user_id_from_token
 from .config import settings
 from .config_repo import repo
+from .tracing import observe
 
 logger = logging.getLogger(__name__)
 
@@ -123,27 +125,40 @@ def close_browser() -> dict:
 
 
 @app.post("/ask", response_model=AskResp)
+@observe(name="ask", as_type="agent", capture_input=False, capture_output=False)
 def ask(req: AskReq, authorization: str | None = Header(default=None)) -> AskResp:
+    """/ask 這條的 trace 根。
+
+    capture_input/output 關掉是因為自動擷取會把整個 AskReq（含前端帶上來的完整 history）
+    與 AskResp（含所有來源）序列化進去——那些在底下的 span 已經看得到，重複記只會讓
+    trace 列表變得難讀。改用 set_trace_io 只放「問題 → 答案」這一組。
+    """
     end_user_id = end_user_id_from_token(authorization)  # 驗證 token；沒帶/無效 → 匿名
-    result = run(req.message, history=req.history, session_id=req.session_id,
-                 end_user_id=end_user_id)
-    sources = [
-        Source(title=s.get("title", ""), url=s.get("url", ""),
-               created_at=s.get("created_at", ""), source=s.get("source", ""))
-        for s in result.get("sources", [])
-        if s.get("url")
-    ]
-    # M4/M5：把這一輪寫進後台 MySQL（fail-safe，寫不進去不影響回應）
-    memory_store.persist_turn(
-        req.session_id, req.message, result["answer"],
-        used_tools=result.get("used_tools"), sources=result.get("sources"),
-        agent_id=(repo.get_active_agent() or {}).get("id"), end_user_id=end_user_id,
-        chart=result.get("chart"),
-    )
-    # 個人化長期記憶：萃取『使用者事實』後存進向量記憶（fail-safe；匿名/無事實自動略過）
-    user_memory.remember(end_user_id, req.message, result["answer"], session_id=req.session_id)
-    return AskResp(answer=result["answer"], used_tools=result["used_tools"], sources=sources,
-                   chart=result.get("chart"))
+    # 一進來就進 trace_context：propagate_attributes 只影響「之後」建立的 span，
+    # 晚進的話前面那些 span 不會被歸戶，依使用者／session 的成本統計就會少算。
+    with tracing.trace_context(req.session_id, end_user_id, trace_name="ask"):
+        result = run(req.message, history=req.history, session_id=req.session_id,
+                     end_user_id=end_user_id)
+        sources = [
+            Source(title=s.get("title", ""), url=s.get("url", ""),
+                   created_at=s.get("created_at", ""), source=s.get("source", ""))
+            for s in result.get("sources", [])
+            if s.get("url")
+        ]
+        # M4/M5：把這一輪寫進後台 MySQL（fail-safe，寫不進去不影響回應）
+        memory_store.persist_turn(
+            req.session_id, req.message, result["answer"],
+            used_tools=result.get("used_tools"), sources=result.get("sources"),
+            agent_id=(repo.get_active_agent() or {}).get("id"), end_user_id=end_user_id,
+            chart=result.get("chart"),
+        )
+        # 個人化長期記憶：萃取『使用者事實』後存進向量記憶（fail-safe；匿名/無事實自動略過）
+        user_memory.remember(end_user_id, req.message, result["answer"], session_id=req.session_id)
+        # 反幻覺規定的自動稽核：純字串比對、不呼叫 LLM，結果以 score 掛在這個 trace 上
+        audit.audit_and_score(result["answer"], result.get("sources"), result.get("used_tools"))
+        tracing.set_trace_io(input=req.message, output=result["answer"])
+        return AskResp(answer=result["answer"], used_tools=result["used_tools"], sources=sources,
+                       chart=result.get("chart"))
 
 
 @app.post("/logout", response_model=LogoutResp)
@@ -254,6 +269,7 @@ def demo_auth(kind: str, req: EndAuthReq) -> JSONResponse:
     return JSONResponse(body, status_code=r.status_code)
 
 
+@observe(name="ws_ask", as_type="agent", capture_input=False, capture_output=False)
 def _run_blocking(question: str, history: list[dict], session_id: str,
                   end_user_id: int | None, cancel_event: threading.Event,
                   emit: Callable[[dict], None]) -> None:
@@ -261,17 +277,34 @@ def _run_blocking(question: str, history: list[dict], session_id: str,
 
     所有結果都以事件送出，包含終結事件（done / cancelled / error）——/ws/ask 的排空迴圈
     靠它收工，所以這裡任何一條路徑都必須恰好送出一個終結事件。
+
+    /ws/ask 這條的 trace 根就設在這裡（而不是外層的 async `_stream_one`）：整段 agent 都在
+    這個 worker thread 內跑完，根設在執行緒裡最單純。`asyncio.to_thread` 會自動複製
+    contextvars，所以就算日後改成在外層開根 span 也接得起來。
+    capture_input 關掉：參數裡有 threading.Event 與 emit callable，序列化沒有意義。
     """
+    with tracing.trace_context(session_id, end_user_id, trace_name="ws_ask"):
+        _run_blocking_inner(question, history, session_id, end_user_id, cancel_event, emit)
+
+
+def _run_blocking_inner(question: str, history: list[dict], session_id: str,
+                        end_user_id: int | None, cancel_event: threading.Event,
+                        emit: Callable[[dict], None]) -> None:
+    """_run_blocking 的實作本體（拆開只為了讓 trace_context 包住整段，見上）。"""
     try:
         with progress.session(emit, cancel_event):
             result = agent.run_streaming(question, history=history,
                                          session_id=session_id, end_user_id=end_user_id)
     except progress.Cancelled:
         emit({"type": "cancelled"})
+        tracing.set_span(level="WARNING", status_message="使用者中途取消")
+        tracing.set_trace_io(input=question, output="（使用者取消）")
         return
     except Exception as e:  # noqa: BLE001 — 任何失敗都要讓前端收得到終結事件
         logger.exception("/ws/ask 執行失敗")
         emit({"type": "error", "message": str(e)})
+        tracing.set_span(level="ERROR", status_message=str(e))
+        tracing.set_trace_io(input=question, output=f"（失敗）{e}")
         return
 
     # 落地與長期記憶：與 /ask 完全相同（皆 fail-safe）。取消的那一輪不寫，因為沒有答案。
@@ -283,6 +316,8 @@ def _run_blocking(question: str, history: list[dict], session_id: str,
         chart=result.get("chart"),
     )
     user_memory.remember(end_user_id, question, result["answer"], session_id=session_id)
+    # 與 /ask 同一套稽核（見該處註解）。放在 emit done 之前也無妨——純字串比對，微秒等級。
+    audit.audit_and_score(result["answer"], sources, result.get("used_tools"))
     # 追問建議：依這一輪問答產生幾個 follow-up（fail-safe，產不出來就回 []）。
     # 只在 done 這條路徑做；cancelled/error 不做。放這裡＝晚 ~1s，但答案文字早已串流完。
     # memories：agent 這輪已撈回的使用者事實，直接沿用（suggest 不再搜一次——同 query 結果一樣，
@@ -298,6 +333,7 @@ def _run_blocking(question: str, history: list[dict], session_id: str,
         "chart": result.get("chart"),  # 圖表已由 chart 事件即時畫出；這裡帶著是為了 /ask 與還原
         "suggestions": suggestions,    # 追問建議（前端點了填入輸入框可改再送；不進 history）
     })
+    tracing.set_trace_io(input=question, output=result["answer"])
 
 
 async def _stream_one(ws: WebSocket, msg: dict, end_user_id: int | None,

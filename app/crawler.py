@@ -30,7 +30,7 @@ class Post(TypedDict):
     url: str
     content: str
     created_at: str  # 'YYYY-MM-DD HH:MM:SS'（台北時間，越新越前）
-    source: str      # 平台標籤：'dcard' | 'ptt'（給合併後的來源分流／UI 分組用）
+    source: str      # 平台標籤：'dcard' | 'ptt' | 'threads'（給合併後的來源分流／UI 分組用）
 
 
 # 使用者可能講的板名 → Dcard_demo 真實 alias（清單見 dcard_crawler.config.BOARDS）

@@ -117,9 +117,56 @@ class Settings:
     # PTT 即時爬：抓完後對每篇 title+body 前段做 embed，跟原問題比 cosine 相似度，
     # 過門檻才收。避免 LLM 抽關鍵字時把「看法/評價/心得」這種無主體泛詞單獨搜、
     # 撈回一堆與問題無關的貼文（如問「福智教育看法」卻拿到「周星馳的評價」）。
+    #
+    # 門檻從 0.5 下修到 0.30，因為 0.5 從來沒有被真正執行過：舊版 rerank 用 p.title 存取
+    # Post，但 Post 是 TypedDict（＝dict），屬性存取必定拋 AttributeError 並被 except 吞掉、
+    # 回傳未過濾的原清單。修好後實測「輝達進駐北士科」49 篇的分數是
+    # 最高 0.448 / 中位 0.356 / 最低 0.179——沿用 0.5 會一篇不留（那 49 篇全是對題的輝達文）。
+    # 0.30 保留 42 篇，同時仍能擋掉真正的雜訊（周星馳那類離題文分數約 0.1~0.2）。
     ptt_rerank_enabled: bool = os.environ.get(
         "PTT_RERANK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-    ptt_min_score: float = _float("PTT_MIN_SCORE", 0.5)
+    ptt_min_score: float = _float("PTT_MIN_SCORE", 0.30)
+
+    # ---- Threads 即時爬（httpx 讀 SSR JSON，免登入、不必開瀏覽器；ThreadsSource）----
+    # 預算 90 秒看起來很長，但三平台是並行的、總時長取 max()，而 Dcard 就要 200 秒——
+    # 所以這條放到 90 秒完全不會增加使用者感受到的等待。
+    threads_time_budget: int = _int("THREADS_TIME_BUDGET", 90)
+    # broad（無參數，約 60 筆／近三週）｜recent（serp_type=default，約 20 筆／最近 1~2 天）。
+    # 預設 broad：即時問答沒有「每天累積時間窗」的機會，一次就要夠量，精準度交給語意過濾。
+    threads_mode: str = os.environ.get("THREADS_MODE", "broad").strip().lower()
+    threads_max_posts: int = _int("THREADS_MAX_POSTS", 20)     # 最終回傳上限（避免壓過其他平台）
+    # strict：只留本文真的含關鍵字的貼文。broad 模式會夾帶「字面沒命中但被平台判定相關」的
+    # 貼文，實測搜「輝達／北士科」會混進森田輝（日本藝人）、北科大——它們靠單字重疊擠進來，
+    # 語意分數還偏高，拉門檻擋不掉，只有字面檢查擋得住。輿情統計要的是乾淨樣本，故預設開。
+    threads_strict: bool = os.environ.get(
+        "THREADS_STRICT", "true").strip().lower() in ("1", "true", "yes", "on")
+    threads_expand_max: int = _int("THREADS_EXPAND_MAX", 10)   # 最多展開幾篇的回覆串（上限非保證）
+    threads_min_replies: int = _int("THREADS_MIN_REPLIES", 1)  # 至少幾則回覆才值得展開
+    threads_max_replies: int = _int("THREADS_MAX_REPLIES", 15)  # 每篇取前幾則回覆（依讚數）
+    # 禮貌限速：不帶登入憑證，最壞是 IP 被限流。原 threads_watch 預設 3 秒，這裡壓到 1.5
+    # 才能在預算內展開 10 篇；不要再往下調。
+    threads_min_interval: float = _float("THREADS_MIN_INTERVAL", 1.5)
+    threads_jitter: float = _float("THREADS_JITTER", 1.0)
+    threads_request_timeout: int = _int("THREADS_REQUEST_TIMEOUT", 20)
+    # 語言過濾：Threads 搜尋是全球的（搜 OpenAI 回 49 筆裡 zh_TW 只有 1 筆），
+    # 不濾的話「台灣網友怎麼看」會混進一半英文貼文。
+    threads_lang_filter: bool = os.environ.get(
+        "THREADS_LANG_FILTER", "true").strip().lower() in ("1", "true", "yes", "on")
+    # 語意過濾：Threads 只能單詞查、又不做交集（「OpenAI」「越獄」只能各搜再合併），
+    # 所以這關不是保險而是唯一的相關性機制。
+    # 門檻 0.30 是實測訂的，不能沿用 PTT/Dcard 的 0.5：Threads 貼文又短又破碎（常只有一兩句
+    # 加表情符號），短文本對長問句的 cosine 天生偏低。實測「輝達進駐北士科」那題 44 篇的
+    # 分數是 最高 0.407 / 中位 0.278 / 最低 0.111——用 0.45 會一篇都不留，0.30 留 16 篇。
+    threads_rerank_enabled: bool = os.environ.get(
+        "THREADS_RERANK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    threads_min_score: float = _float("THREADS_MIN_SCORE", 0.30)
+
+    # ---- 立場統計（stance_breakdown）----
+    # 追問「畫圖」時沿用上一輪貼文的語意門檻：同一場對話問過多個話題時，「上一輪」不保證
+    # 就是使用者要統計的那一輪。實測兩批真實貼文對議題句「慈濟被詐騙10億這件事」的分數——
+    # 對題 0.387~0.719、離題（輝達）0.163~0.355，中間有空隙，取 0.35 對題全留、離題幾乎全丟。
+    # （比各平台爬蟲的門檻高，因為 issue 是『陳述句』，embedding 品質比問句好得多。）
+    stance_reuse_min_score: float = _float("STANCE_REUSE_MIN_SCORE", 0.35)
 
     # ---- 追問建議（follow-up；當輪答完後產生，前端點了填入輸入框可改再送）----
     suggest_enabled: bool = os.environ.get(
@@ -132,6 +179,18 @@ class Settings:
     suggest_personalize: bool = os.environ.get(
         "SUGGEST_PERSONALIZE", "true").strip().lower() in ("1", "true", "yes", "on")
     suggest_personalize_max: int = _int("SUGGEST_PERSONALIZE_MAX", 1)  # 至多幾題個人化（其餘保持通用）
+
+    # ---- Langfuse prompt 管理（可觀測性平台那邊改 prompt，不必改 code 重啟）----
+    # 取值優先序刻意是「後台 agent > Langfuse > 本檔寫死值」：後台的 prompt 管理是既有的
+    # 產品功能（M3），Langfuse 不該把它蓋掉，只補上『後台沒設時』那一格，並帶來版本歷史
+    # 與 diff。關掉（或 Langfuse 連不上）就完全退回原本行為。
+    langfuse_prompt_enabled: bool = os.environ.get(
+        "LANGFUSE_PROMPT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    langfuse_prompt_name: str = os.environ.get("LANGFUSE_PROMPT_NAME", "seiqa-system").strip()
+    # 用哪個標籤的版本：production＝Langfuse UI 上標記為正式的那一版（可隨時回滾）
+    langfuse_prompt_label: str = os.environ.get("LANGFUSE_PROMPT_LABEL", "production").strip()
+    # 本地快取秒數：避免每題都打一次 Langfuse。改了 prompt 最多等這麼久才生效。
+    langfuse_prompt_ttl: int = _int("LANGFUSE_PROMPT_TTL", 60)
 
     # ---- 後台共用 MySQL（M3：唯讀讀設定；db_host 留空＝停用，全走上面的 .env/寫死值）----
     db_host: str = os.environ.get("DB_HOST", "").strip()

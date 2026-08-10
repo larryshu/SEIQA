@@ -9,8 +9,8 @@
 ## 0. 一句話定位
 
 使用者用自然語言問「鄉民口碑類」問題（例：遠距離戀愛能維持嗎？某支耳機評價如何？），
-系統以 **LLM function calling** 自主決定要不要查社群，需要時**同時並行**去 Dcard（即時爬 + 向量庫 fallback）
-與 PTT（即時爬）撈討論，消化後用「朋友口吻」回答並標註 `[n]` 來源；
+系統以 **LLM function calling** 自主決定要不要查社群，需要時**同時並行**去 Dcard（即時爬 + 向量庫 fallback）、
+PTT（即時爬）與 Threads（免登入即時爬）撈討論，消化後用「朋友口吻」回答並標註 `[n]` 來源；
 問「正反幾成」時再走一個**立場統計** skill（LLM 逐則分類、Python 加總、前端畫圓餅圖，**模型不准自己估比例**）；
 過程支援 **WebSocket 逐字串流與中途取消**；使用者的長期記憶與偏好會跨 session 累積，登出時做摘要收尾。
 
@@ -46,6 +46,7 @@
 │  conversation / message    │                    ┌──────────────────┐
 │  user_preference …         │                    │ Dcard 即時爬     │ DrissionPage→真實 Chrome
 └────────────────────────────┘                    │ PTT  即時爬      │ requests + BeautifulSoup
+                                                  │ Threads 即時爬   │ httpx 讀 SSR JSON（免登入）
             ▲                                     └──────────────────┘
             │ 偏好/設定                                     │ 失敗/空 → fallback
             │                                     ┌──────────────────┐
@@ -245,6 +246,7 @@ class Source(ABC):
 | `dcard`（`DCARD_MODE=live`） | `DcardLiveSource` | DrissionPage 全站文章搜尋 → 深挖內文 + 熱門留言；**失敗/沒撈到 → 自動 fallback 向量庫** |
 | `dcard_vector` | `DcardSource` | Qdrant `dcard_insight` 口碑庫向量檢索 |
 | `ptt` | `PttSource` | requests + bs4 站內搜尋，時間預算內逐篇抓 |
+| `threads` | `ThreadsSource` | httpx 讀 SSR JSON（crawler UA、免登入）；單詞各搜再合併 → 語言/字面/語意三層過濾 → 展開熱門篇回覆串 |
 
 `_build_registry()` 依「後台啟用的平台 + 排序」組出 registry，再套使用者的 `included/excluded_platforms` 偏好；
 DB 不可用就退回 `_DEFAULT_REGISTRY`。**新增一個平台 = 寫一個 adapter + 掛進 `_ADAPTERS`，agent / loop / prompt 全部不動。**
@@ -374,10 +376,11 @@ WebSocket 把「Agent 現在在做什麼」變成看得見的產品行為，並�
 | `search_start` | `sources` | 這次並行查哪些平台 |
 | `source_start` / `source_done` / `source_error` | `sources._safe_fetch` | 各平台開始 / 抓到幾則 + 耗時 / 該平台失敗 |
 | `source_fallback` | `sources.DcardLiveSource` | Dcard 即時爬失敗 → 退向量庫（**降級行為變成看得見的事**） |
-| `crawl_plan` | `ptt` / `dcard_live` | LLM 挑的看板與關鍵詞 |
-| `crawl_search` | `dcard_live` | 搜尋頁找到幾篇 |
-| `crawl_progress` | `ptt` / `dcard_live` | 逐篇進度 |
-| `crawl_budget` | `ptt` / `dcard_live` | 時間預算用完，回目前已抓到的 |
+| `crawl_plan` | `ptt` / `dcard_live` / `threads` | LLM 挑的看板與關鍵詞 |
+| `crawl_search` | `dcard_live` / `threads` | 搜尋頁找到幾篇（Threads 在過濾前後各推一次） |
+| `crawl_progress` | `ptt` / `dcard_live` / `threads` | 逐篇進度 |
+| `crawl_budget` | `ptt` / `dcard_live` / `threads` | 時間預算用完，回目前已抓到的 |
+| `<平台>_rerank` | `relevance.rerank` | 語意過濾留下/丟掉幾篇（`ptt_rerank` / `dcard_rerank` / `threads_rerank`） |
 | `search_done` | `sources` | 合併總數 + 各平台則數 |
 | `stance_progress` | `stance` | 立場判讀進度（已判讀 / 總則數；逐批更新） |
 | `chart` | `tools._stance_breakdown` | **統計完成的結構化數據**（counts / percent / by_platform / items / low_sample）→ 前端據此畫 SVG 圓餅圖。**圖在模型開口之前就先出現了** |
@@ -697,6 +700,7 @@ DRF 那側也處理了 N+1：`prefetch_related("skills")` / `prefetch_related("c
 | Dcard 即時爬 | Dcard 網站（DrissionPage 驅動真實 Chrome） | `app/dcard_live.py` | LLM 抽關鍵字 → 全站文章搜尋 → 時間預算內深挖內文+熱門留言；單例瀏覽器 + Lock；**失敗/空 → fallback 向量庫** |
 | Dcard 向量檢索 | Qdrant `POST /collections/dcard_insight/points/search` | `app/vectorstore.py` | LLM 多面向查詢改寫 → 各查一次 → **round-robin 合併** → url 去重 → 分數門檻 |
 | PTT 即時爬 | `https://www.ptt.cc/bbs/<board>/search` | `app/ptt.py` | LLM 從 16 板白名單挑板 + 產多個單一關鍵詞（PTT 標題搜尋是 AND）→ requests + bs4 翻頁逐篇抓 → 時間預算 + 禮貌限速 |
+| Threads 即時爬 | `https://www.threads.com/search/?q=`（SSR JSON） | `app/threads.py` | crawler UA 才拿得到 payload；**搜尋只吃單一詞**（含空白一律 0 筆）→ LLM 抽核心實體、各詞搜一次合併 → 語言/字面/語意三層過濾 → 依回覆數展開熱門篇的回覆串（折進主文） |
 | 逐字串流 | `WS /ws/ask` | `app/api.py`、`app/progress.py`、`llm.chat_with_tools_stream()` | worker thread 跑阻塞 agent → `contextvars` 匯流排 `emit()` → `call_soon_threadsafe` 進 asyncio queue → `ws.send_json()` |
 | 中途取消 | `{"type":"cancel"}` | `app/progress.py` | `threading.Event` + 各層檢查點；`Cancelled(BaseException)` 穿過所有 `except Exception` 的 fail-safe 網 |
 | 對話落地 | （內部）MySQL `crawl_rw` | `app/memory_store.py` | 依 sid 找/建 conversation → 插 user + assistant 兩則 message（含 used_tools / sources JSON）→ 失敗只 log |
@@ -756,7 +760,8 @@ DRF 那側也處理了 N+1：`prefetch_related("skills")` / `prefetch_related("c
 | LLM | `LLM_API_KEY` / `CHAT_MODEL` / `EMBED_MODEL` / `LLM_BASE_URL` / `AZURE_OPENAI_ENDPOINT` |
 | 檢索 | `QDRANT_URL` / `INSIGHT_COLLECTION` / `SEARCH_TOP_K` / `SEARCH_EXPAND_N` / `SEARCH_MIN_SCORE` |
 | Dcard 即時爬 | `DCARD_MODE`(live\|vector) / `DCARD_TIME_BUDGET` / `DCARD_DEEP_MAX` / `DCARD_HEADLESS` / `DCARD_USER_DATA_DIR` |
-| PTT | `PTT_TIME_BUDGET` / `PTT_MIN_DELAY` / `PTT_MAX_DELAY` |
+| PTT | `PTT_TIME_BUDGET` / `PTT_MIN_DELAY` / `PTT_MAX_DELAY` / `PTT_MIN_SCORE` |
+| Threads | `THREADS_TIME_BUDGET` / `THREADS_MODE` / `THREADS_EXPAND_MAX` / `THREADS_STRICT` / `THREADS_LANG_FILTER` / `THREADS_MIN_SCORE` |
 | 記憶 | `USER_MEMORY_ENABLED` / `USER_MEMORY_TOP_K` / `USER_MEMORY_MIN_SCORE` / `USER_THREAD_*` / `PREF_INFER_*` |
 | DB | `DB_HOST` / `DB_NAME` / `DB_USER`(ro) / `DB_RW_USER`(rw) / `CONFIG_CACHE_TTL` |
 | 認證 | `TOKEN_SECRET`（Django 與 runtime **必須相同**） / `ADMIN_API_URL` |

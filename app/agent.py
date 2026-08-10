@@ -1,7 +1,7 @@
 """Agent loop：LLM ↔ 工具的多輪循環（規劃→工具→行動），借鑑 Hermes 的自主工具呼叫。
 
 流程：把 system + 對話歷史 + 提問丟給 LLM →
-  - 它若決定要最新資訊 → 回 tool_calls → 我們執行 community_search（並行即時爬 Dcard+PTT）→ 把結果塞回 →再問一次
+  - 它若決定要最新資訊 → 回 tool_calls → 我們執行 community_search（並行即時爬各社群平台）→ 把結果塞回 →再問一次
   - 它若覺得夠了 → 直接回文字答案
 fail-safe：工具炸掉/沒結果，crawler 與 tools 已各自吞例外，最終一定回得了話。
 
@@ -16,16 +16,20 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from . import llm, progress, user_memory
+from . import llm, progress, tracing, user_memory
 from .config import settings
 from .config_repo import repo
 from .llm import chat_with_tools
 from .tools import TOOLS, dispatch
+from .tracing import observe
 
+# 刻意不寫死平台名稱：啟用哪些平台由後台與使用者偏好決定，而 community_search 的回傳
+# 開頭就會列出「本次有撈到資料的平台／沒撈到的平台」。prompt 裡再列一次清單，只會在加減
+# 平台時變成過期資訊，並讓模型提到根本沒查的平台。
 SYSTEM_PROMPT = (
     "你是一個熟悉網路鄉民討論的貼心朋友，不是制式的查詢助理。"
     "當問題需要鄉民民間討論／口碑／心得／時事時，用 community_search 工具——"
-    "它會『同時』即時爬 Dcard 與 PTT，把兩邊討論一起撈回來。"
+    "它會『同時』即時爬多個社群平台，把各邊討論一起撈回來。"
     "純常識、定義、計算等不需要鄉民經驗的問題，直接回答即可、不用查。"
     "\n\n"
     "【回答方式——這是重點】"
@@ -37,11 +41,16 @@ SYSTEM_PROMPT = (
     "語氣口語、自然，像在跟朋友聊天，而不是寫條目。"
     "\n\n"
     "【綜合來源 + 引用】"
-    "抓回來的討論開頭會標來源平台（Dcard / PTT）。請『綜合』實際有抓到的來源一起講，"
-    "可以自然帶出差異或出處，例如『Dcard 上比較多人說…，PTT 鄉民則覺得…』。"
-    "工具會註明這次哪些平台沒有資料；沒有資料的平台就完全不要提、不要假裝它上面有討論。"
-    "當某個具體說法來自抓到的討論時，在句尾自然帶上 [n]，不用每句都標、"
-    "也不要讓來源變成回答的主角。不要杜撰來源。"
+    "抓回來的每則討論開頭都會用括號標出它的來源平台。請『綜合』實際有抓到的來源一起講，"
+    "可以自然帶出平台之間的差異或出處，例如『Dcard 上比較多人說…，PTT 鄉民則覺得…』"
+    "（實際講哪些平台，以這次真的有撈到的為準）。"
+    "工具開頭會註明這次哪些平台有資料、哪些沒有；沒有資料的平台就完全不要提、"
+    "不要假裝它上面有討論。"
+    "當某個具體說法來自抓到的討論時，在句尾標上『那則討論的實際編號』——編號就是工具回傳裡"
+    "每則開頭中括號中的數字，例如引用第 3 則就寫 [3]、第 17 則就寫 [17]。"
+    "**絕對不可以原樣輸出「[n]」**：n 只是講解時的代號，不是真的字；輸出 [n] 讀者點不到來源，"
+    "等同假引用。中括號裡一定要是實際數字。"
+    "不用每句都標、也不要讓來源變成回答的主角。不要杜撰來源。"
     "\n\n"
     "【比例與圖表】"
     "當使用者問『比例』『幾成』『多少人覺得』『正反意見如何』或要圖表時，"
@@ -51,12 +60,12 @@ SYSTEM_PROMPT = (
     "**也絕對不要用文字、方塊或符號拼出長條圖／圓餅圖**——那不是圖，是雜訊。"
     "統計出來之後，你的工作是用『文字』解釋這個分佈代表什麼、兩邊各在意什麼。"
     "\n\n"
-    "【兩邊都沒有相關資料時】"
-    "就以朋友的身分用既有常識／經驗給建議，並誠實說這次沒在 Dcard 與 PTT 找到相關討論。"
+    "【所有平台都沒有相關資料時】"
+    "就以朋友的身分用既有常識／經驗給建議，並誠實說這次沒在社群平台上找到相關討論。"
 )
 
 # 2 輪：一輪 community_search 撈討論，必要時第二輪 stance_breakdown 做立場統計。
-# （單一 community_search 內部已並行查兩邊，所以「查」本身一輪就夠。）
+# （單一 community_search 內部已並行查所有平台，所以「查」本身一輪就夠。）
 MAX_TOOL_ROUNDS = 2
 
 
@@ -114,7 +123,7 @@ def _apply_thread_context(prompt: str, threads: list[str]) -> str:
             "什麼（例：你之前問過台北市那次放颱風假的評價，當時社群主要分成…）；\n"
             "2. 回顧只是引子——主體與結論一律以本次查到的最新討論為準，不可讓舊梗概"
             "取代或稀釋這次的內容；\n"
-            "3. 回顧的句子不可標 [n]：[n] 只屬於本次查到的貼文，舊脈絡沒有對應來源，"
+            "3. 回顧的句子不可標來源編號：編號只屬於本次查到的貼文，舊脈絡沒有對應來源，"
             "標上去就是假出處；\n"
             "4. 若本次查到的風向和先前討論不同，明確點出變化（例：上次討論時主流是…，"
             "這次多了…），這比單純複述更有價值；\n"
@@ -141,6 +150,42 @@ def _refresh_recap_hint(messages: list[dict], ctx: "_RunContext") -> None:
     messages.append({"role": "system", "content": ctx.recap_hint})
 
 
+def _resolve_system_prompt(cfg: dict) -> tuple[str, str]:
+    """決定這輪用哪份 system prompt，回 (內容, 來源標記)。
+
+    優先序：**後台 agent > Langfuse > 本檔寫死值**。
+
+    為什麼 Langfuse 不排第一：後台的 prompt 管理是既有的產品功能（M3），使用者在後台改了
+    prompt 卻被 Langfuse 悄悄蓋掉，是最難查的那種 bug。Langfuse 補的是「後台沒設／DB 連不上」
+    那一格，順便帶來版本歷史、diff 與回滾——而不是搶走主導權。
+
+    來源標記會寫進 span：改完 prompt 回頭看舊 trace 時，要分得出那個答案是哪一版生的。
+    """
+    if cfg.get("system_prompt"):
+        return cfg["system_prompt"], "admin_backend"
+    if not settings.langfuse_prompt_enabled:
+        return SYSTEM_PROMPT, "builtin"
+    return tracing.get_prompt(
+        settings.langfuse_prompt_name, fallback=SYSTEM_PROMPT,
+        label=settings.langfuse_prompt_label, ttl_seconds=settings.langfuse_prompt_ttl,
+    )
+
+
+def _finish_span(user_message: str, answer: str, used_tools: list[str],
+                 sources: list[dict]) -> None:
+    """收尾時把這輪的重點寫進 agent span（兩個 loop 各有兩個出口，故抽成一支）。
+
+    刻意不把 messages 整包放進去：那裡面是工具回傳的上萬字貼文，底下的 tool span 已經
+    完整記過一次，重複只會讓 trace 難讀、也讓 ClickHouse 白吃儲存空間。
+    """
+    tracing.set_span(
+        input=user_message,
+        output=answer,
+        metadata={"used_tools": used_tools, "sources": len(sources),
+                  "light": "green" if sources else "yellow"},
+    )
+
+
 class _RunContext(NamedTuple):
     """一輪對話的所有已解析設定：run() 與 run_streaming() 共用，確保兩條路徑行為一致。"""
 
@@ -153,6 +198,7 @@ class _RunContext(NamedTuple):
     recap_hint: str      # 命中脈絡時的回顧提醒；空＝沒脈絡或關閉（見 _refresh_recap_hint）
 
 
+@observe(name="build_context", capture_input=False, capture_output=False)
 def _build_context(user_message: str, history: list[dict] | None,
                    end_user_id: int | None) -> _RunContext:
     """組 system prompt（偏好 + 記憶 + 脈絡）與各項設定，並鋪好 messages 陣列。
@@ -163,7 +209,8 @@ def _build_context(user_message: str, history: list[dict] | None,
     cfg = repo.get_active_agent() or {}
     prefs = repo.get_user_preferences(end_user_id) if end_user_id else {}
     # 取值優先序：user_preference > agent > system_setting/.env
-    system_prompt = _apply_pref_modifiers(cfg.get("system_prompt") or SYSTEM_PROMPT, prefs)
+    base_prompt, prompt_source = _resolve_system_prompt(cfg)
+    system_prompt = _apply_pref_modifiers(base_prompt, prefs)
     memories: list[str] = []
     threads: list[str] = []
     if end_user_id:  # 登入使用者：meta 問題列出全部記憶；一般問題語意撈回（皆 fail-safe）
@@ -189,13 +236,28 @@ def _build_context(user_message: str, history: list[dict] | None,
     if threads and settings.thread_recap_enabled:
         recap_hint = (
             "（提醒：本輪有【先前相關對話的脈絡】。請照 system 的指示——開場先用一兩句回顧"
-            "之前聊過的重點再進入主體；回顧那句不可標 [n]；主體與結論仍以上面查到的最新討論"
-            "為準；風向有變就點出差異。若脈絡與本題確實不相關，就完全不要提。）"
+            "之前聊過的重點再進入主體；回顧那句不可標來源編號；主體與結論仍以上面查到的最新"
+            "討論為準；風向有變就點出差異。若脈絡與本題確實不相關，就完全不要提。）"
         )
 
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(history or [])
     messages.append({"role": "user", "content": user_message})
+
+    # 把「組好的 system prompt」原文放進 span：偏好／原子記憶／脈絡是一層層疊上去的，
+    # 最終長什麼樣以前只能靠推測（_refresh_recap_hint 那個「回顧要求被工具結果稀釋」的
+    # 問題就是這樣發現的）。這裡記下來，之後改 prompt 有沒有生效可以直接比對。
+    tracing.set_span(
+        output={"system_prompt": system_prompt, "system_prompt_chars": len(system_prompt)},
+        metadata={
+            "facts": len(memories),
+            "threads": len(threads),
+            "history_turns": len(history or []),
+            "model": prefs.get("model") or cfg.get("model") or settings.chat_model,
+            "recap": bool(recap_hint),
+            "prompt_source": prompt_source,   # admin_backend / seiqa-system:v3 / builtin / fallback
+        },
+    )
 
     return _RunContext(
         messages=messages,
@@ -208,6 +270,7 @@ def _build_context(user_message: str, history: list[dict] | None,
     )
 
 
+@observe(name="agent_loop", capture_input=False, capture_output=False)
 def run(user_message: str, history: list[dict] | None = None, session_id: str = "default",
         end_user_id: int | None = None) -> dict:
     """跑一輪對話（阻塞式，一次回完整答案）。回傳 {answer, used_tools, sources, messages, memories}。
@@ -226,6 +289,7 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
         msg = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model)
         if not msg.tool_calls:
             messages.append({"role": "assistant", "content": msg.content or ""})
+            _finish_span(user_message, msg.content or "", used_tools, sources)
             return {"answer": msg.content or "", "used_tools": used_tools, "sources": sources,
                     "chart": charts[-1] if charts else None, "messages": messages,
                     "memories": ctx.memories}
@@ -248,6 +312,7 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
                             tool_choice="none")
     answer = final.content or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
     messages.append({"role": "assistant", "content": answer})
+    _finish_span(user_message, answer, used_tools, sources)
     return {"answer": answer, "used_tools": used_tools, "sources": sources,
             "chart": charts[-1] if charts else None, "messages": messages,
             "memories": ctx.memories}
@@ -269,6 +334,7 @@ def _stream_once(ctx: _RunContext, messages: list[dict],
     return msg, streamed
 
 
+@observe(name="agent_loop_streaming", capture_input=False, capture_output=False)
 def run_streaming(user_message: str, history: list[dict] | None = None,
                   session_id: str = "default", end_user_id: int | None = None) -> dict:
     """與 run() 同樣的 loop 與回傳值，但過程中用 progress.emit() 推事件、並可被取消。
@@ -292,6 +358,7 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
             if not streamed:  # 模型沒串出東西（極少見）→ 補送一次，前端才有內容
                 progress.emit("token", text=answer)
             messages.append({"role": "assistant", "content": answer})
+            _finish_span(user_message, answer, used_tools, sources)
             return {"answer": answer, "used_tools": used_tools, "sources": sources,
                     "chart": charts[-1] if charts else None, "messages": messages,
                     "memories": ctx.memories}
@@ -320,6 +387,7 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
     if not streamed:
         progress.emit("token", text=answer)
     messages.append({"role": "assistant", "content": answer})
+    _finish_span(user_message, answer, used_tools, sources)
     return {"answer": answer, "used_tools": used_tools, "sources": sources,
             "chart": charts[-1] if charts else None, "messages": messages,
             "memories": ctx.memories}

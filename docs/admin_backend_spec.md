@@ -31,7 +31,7 @@
 
 系統「社群輿情智能問答」現由三個服務、兩個終端前端組成（本規格書寫的是其中的後台）：
 
-- **FastAPI runtime**（`app/`，:8001）：跑 agent loop，呼叫 `community_search` skill，並行 fan-out 到即時爬 Dcard（DrissionPage 過 Cloudflare；失敗退回 Qdrant 向量庫 fallback）與即時爬 PTT，綜合回答；問「比例／正反意見」時再呼叫第二個 skill `stance_breakdown` 做立場統計（LLM 逐則分類、Python 加總，前端畫圖）。另自行提供 WebSocket demo 前端與登入代理。
+- **FastAPI runtime**（`app/`，:8001）：跑 agent loop，呼叫 `community_search` skill，並行 fan-out 到即時爬 Dcard（DrissionPage 過 Cloudflare；失敗退回 Qdrant 向量庫 fallback）、即時爬 PTT 與即時爬 Threads（crawler UA 讀 SSR JSON，免登入），綜合回答；問「比例／正反意見」時再呼叫第二個 skill `stance_breakdown` 做立場統計（LLM 逐則分類、Python 加總，前端畫圖）。另自行提供 WebSocket demo 前端與登入代理。
 - **Streamlit 聊天 UI**（`ui/`，:8501）：阻塞式問答（走 `POST /ask`）；對話以 JSON 檔存在 `ui/.sessions/`（**僅前端快取**——訊息本體自 M4 起落地 MySQL，見 §6.3）。
 - **WebSocket demo 前端**（`app/static/ws_demo.html`，由 runtime 的 `GET /demo` 提供）：即時進度事件、逐字串流、中途取消、立場分佈圖；F5／換裝置可用 `GET /conversation/{sid}` 從 MySQL 還原對話。
 
@@ -315,8 +315,8 @@ erDiagram
 #### `source_platform`（對應 `sources.py` REGISTRY）
 | 欄位 | 型別 | 限制 / 說明 |
 |---|---|---|
-| name | VARCHAR(32) | UNIQUE，例：dcard / ptt / mobile01 |
-| display_name | VARCHAR(64) | 例：Dcard / PTT |
+| name | VARCHAR(32) | UNIQUE，例：dcard / ptt / threads / mobile01 |
+| display_name | VARCHAR(64) | 例：Dcard / PTT / Threads。**runtime 會拿它當「給 LLM 看的平台名」**（`sources.Source.label`），不只是後台顯示 |
 | adapter_key | VARCHAR(64) | 對應 runtime adapter |
 | kind | VARCHAR(16) | 'vector' / 'live_crawl' |
 | is_active | BOOL | DEFAULT 1（開關此平台） |
@@ -533,7 +533,7 @@ FastAPI runtime 新增一層 **`ConfigRepository`**：用唯讀 MySQL 帳號讀�
 | `agent.py` `SYSTEM_PROMPT` / `MAX_TOOL_ROUNDS` | `agent`（`is_active=1` 那筆） | 換 prompt 不用改程式 |
 | `tools.py` `TOOLS` | `skill` + `agent_skill` | 組出 function-calling schema |
 | `sources.py` `REGISTRY` 啟用與順序 | `source_platform`（`is_active` / `sort_order`） | 平台可在後台開關 |
-| 各檢索參數（top_k / min_score / expand_n / PTT 預算…） | `source_config` | 每平台獨立 |
+| 各檢索參數（top_k / min_score / expand_n / PTT・Threads 預算…） | `source_config` | 每平台獨立 |
 | `config.py` 業務設定（model / 門檻 / 逾時…） | `system_setting` | 取代 `.env` 業務欄位 |
 | 每使用者語氣 / 偏好平台 / 答案長度 | `user_preference` | runtime 套用優先序 |
 
@@ -618,10 +618,10 @@ runtime `POST /logout`（帶 `Authorization: Bearer <token>` + 前端整段對�
 一次性 seed / migration 腳本（建議用 Django `manage.py` custom command）：
 
 1. **`system_setting` seed**：把目前 `config.py` 的預設值灌入（chat_model、embed_model、search_top_k、search_expand_n、search_min_score、crawl_timeout、crawl_max_posts、ptt_time_budget、ptt_min_delay、ptt_max_delay…）。
-2. **`source_platform` + `source_config` seed**：`dcard`（live_crawl，active；即時爬失敗退向量庫 fallback）、`ptt`（live_crawl，active），參數由現有 config 預設帶入。
+2. **`source_platform` + `source_config` seed**：`dcard`（live_crawl，active；即時爬失敗退向量庫 fallback）、`ptt`（live_crawl，active）、`threads`（live_crawl，active），參數由現有 config 預設帶入。
 3. **`agent` seed**：用現有 `SYSTEM_PROMPT`、model、**`max_tool_rounds=2`** 建一筆預設 agent 並 `is_active=1`，並 `skills.set([...])` 掛上下面兩個 skill。
 4. **`skill` seed（兩個）**（description = 現有觸發條件文案、json_schema = 現有 parameters）：
-   - `community_search`：查社群討論（並行 fan-out 到 Dcard / PTT）。
+   - `community_search`：查社群討論（並行 fan-out 到所有啟用平台；description 與 agent prompt 皆**不寫死平台名**——啟用哪些平台由 `source_platform` 與 `user_preference` 決定，工具回傳開頭會註明本次有／沒有撈到資料的平台）。
    - `stance_breakdown`：**立場分佈統計**——對「已撈到的」討論逐則判讀，回結構化數據供前端畫圖。
      LLM 只做分類、加總由 runtime 的 Python 端做（`app/stance.py`），所以 seed 的 description 明寫「不要自己估比例、不要用文字畫圖表」。
      這也是 `max_tool_rounds` 要 2 的原因：第一輪查、第二輪算。

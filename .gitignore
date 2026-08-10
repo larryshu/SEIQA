@@ -16,7 +16,7 @@ ui/.sessions/
 
 # 個人用文件 / 簡報素材，不隨程式碼發布
 ROADMAP.md
-*講稿.md
+*.md
 *ppt.py
 *.txt
 *.pptx

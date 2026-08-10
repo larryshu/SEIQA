@@ -1,8 +1,12 @@
 """工具定義 + 分派。對應 Hermes 的「skill」：LLM 用 tool calling 自己決定何時呼叫。
 
-對 LLM 只暴露一個 skill：community_search —— 內部並行 fan-out 到 Dcard + PTT（皆即時爬），
-合併兩邊討論（各帶平台標籤）。各平台的 adapter 在 sources.py 的 registry，加平台只要加 adapter、
-不動這裡。如此「兩邊一定都查」是程式保證的，不靠 LLM 記得同時叫兩個工具。
+對 LLM 只暴露一個 skill：community_search —— 內部並行 fan-out 到所有啟用的社群平台
+（目前 Dcard / PTT / Threads，皆即時爬），合併各邊討論（各帶平台標籤）。各平台的 adapter
+在 sources.py 的 registry，加平台只要加 adapter、不動這裡。如此「每一邊都會查」是程式
+保證的，不靠 LLM 記得逐一叫工具。
+
+平台名稱刻意不寫死在本檔：給 LLM 的「哪些平台有／沒有資料」提示一律用 fan-out 回報的
+platforms 組出來（見 _community_search）。
 
 crawl_dcard（Dcard 即時爬）因 Cloudflare 已停用，程式碼保留在 crawler.py / 下方 _crawl_dcard。
 """
@@ -10,11 +14,12 @@ from __future__ import annotations
 
 import json
 
-from . import crawler, progress, stance
+from . import crawler, progress, relevance, stance, tracing
+from .config import settings
+from .sources import PLATFORM_LABELS as _PLATFORM_LABEL
 from .sources import community_search as _fanout_search
 from .store import store
-
-_PLATFORM_LABEL = {"dcard": "Dcard", "ptt": "PTT"}
+from .tracing import observe
 
 # 給 LLM 看的工具清單（function calling schema）。description 寫清楚「何時該用」＝觸發條件。
 TOOLS: list[dict] = [
@@ -23,7 +28,7 @@ TOOLS: list[dict] = [
         "function": {
             "name": "community_search",
             "description": (
-                "查網路社群討論：會『同時』即時爬 Dcard 與 PTT，撈與使用者問題相關的"
+                "查網路社群討論：會『同時』即時爬所有已啟用的社群平台，撈與使用者問題相關的"
                 "鄉民口碑／心得／評價／經驗／時事討論。當問題需要鄉民實際討論"
                 "（感情、理財、3C 評價、工作、時事、產品心得等）時呼叫此工具；"
                 "純常識、定義、計算等不需鄉民經驗就能回答時，不要呼叫、直接回答即可。"
@@ -84,6 +89,7 @@ TOOLS: list[dict] = [
 ]
 
 
+@observe(as_type="tool", capture_input=False)
 def dispatch(name: str, arguments: str, session_id: str,
              user_query: str = "", sources: list | None = None,
              end_user_id: int | None = None, charts: list | None = None) -> str:
@@ -100,6 +106,11 @@ def dispatch(name: str, arguments: str, session_id: str,
     except json.JSONDecodeError:
         args = {}
 
+    # span 直接以工具名命名（trace 樹上一眼看出這輪叫了哪個 skill）。capture_input 關掉是
+    # 因為 sources/charts 是 out-param：它們在第二輪已經裝著整份貼文清單，自動擷取會把
+    # 那幾萬字重複記進每個 tool span。這裡只留真正是「呼叫參數」的 arguments。
+    tracing.set_span(name=name, input={"arguments": args, "user_query": user_query})
+
     if name == "community_search":
         query = (args.get("query") or "").strip() or user_query
         return _community_search(query, session_id, sources, end_user_id)
@@ -113,14 +124,20 @@ def dispatch(name: str, arguments: str, session_id: str,
 
 def _community_search(query: str, session_id: str, sources: list | None = None,
                       end_user_id: int | None = None) -> str:
-    """並行查 Dcard + PTT，合併兩邊討論。沒命中→請 LLM 退回常識。
+    """並行查所有啟用的社群平台，合併各邊討論。沒命中→請 LLM 退回常識。
 
     end_user_id：有的話，平台會依該使用者的 included/excluded_platforms 偏好過濾（M5）。
+
+    平台名稱一律取自 fan-out 回報的 platforms，不在這裡寫死清單——啟用哪些平台是後台
+    與使用者偏好決定的，寫死會讓新增的平台永遠不出現在給 LLM 的提示裡。
     """
-    posts = _fanout_search(query, end_user_id=end_user_id)
+    posts, platforms = _fanout_search(query, end_user_id=end_user_id)
+    labels = dict(platforms)
     if not posts:
+        names = [label for _, label in platforms]
+        tried = ("、".join(names) + "都") if len(names) > 1 else (names[0] if names else "社群平台")
         return (
-            "（Dcard 與 PTT 都沒有相關討論。請改用你既有的常識／經驗回答，"
+            f"（{tried}沒有相關討論。請改用你既有的常識／經驗回答，"
             "並自然地說一句這次沒在社群找到相關討論，不要杜撰來源。）"
         )
     store.save(session_id, posts)
@@ -129,8 +146,8 @@ def _community_search(query: str, session_id: str, sources: list | None = None,
 
     # 明講這次哪些平台有/沒有資料 → 防止 LLM 對沒撈到的平台杜撰討論
     present = {p.get("source") for p in posts}
-    have = [_PLATFORM_LABEL[s] for s in ("dcard", "ptt") if s in present]
-    missing = [_PLATFORM_LABEL[s] for s in ("dcard", "ptt") if s not in present]
+    have = [label for name, label in platforms if name in present]
+    missing = [label for name, label in platforms if name not in present]
     note = "本次有撈到資料的平台：" + "、".join(have) + "。"
     if missing:
         note += (
@@ -140,12 +157,25 @@ def _community_search(query: str, session_id: str, sources: list | None = None,
 
     lines = []
     for i, p in enumerate(posts):
-        label = _PLATFORM_LABEL.get(p.get("source", ""), p.get("source", ""))
+        src = p.get("source", "")
+        label = labels.get(src) or _PLATFORM_LABEL.get(src, src)
         lines.append(f"[{i + 1}]（{label}）{p['title']}\n{p['content']}\n來源：{p['url']}")
+
+    # 引用規則重複貼在貼文清單「之後」，而不是只放在前面：這批內容動輒上萬字（實測一題
+    # 92 則），開頭的指示會被整個稀釋掉——模型於是照抄字面的「[n]」而不是填實際編號。
+    # 這與 agent._refresh_recap_hint 解決回顧提醒被蓋掉是同一招：要求緊鄰生成點。
+    cite_rule = (
+        f"【引用規則——務必照做】上面每則討論開頭中括號裡的數字就是它的編號（本次是 1～{len(posts)}）。"
+        "當某個說法來自其中某則時，在該句句尾標上『那一則的實際編號』，"
+        "例如引用第 3 則就寫 [3]、引用第 17 則就寫 [17]。\n"
+        "**「n」只是代號，不是要你輸出的字。絕對不可以在答案裡出現「[n]」這三個字元**——"
+        f"那樣讀者點不到來源，等同假引用。每個中括號裡都必須是 1～{len(posts)} 之間的實際數字。\n"
+        "不用每句都標，也不要讓來源變成回答的主角；沒有對應貼文的句子就不要標。"
+    )
     return (
-        note + "\n\n以下為各社群平台撈到的相關討論（開頭括號標了來源平台）。請『綜合』實際有的"
-        "來源消化後回答，用 [n] 標注引用，並在敘述中自然帶出某個說法是來自 Dcard 還是 PTT：\n\n"
-        + "\n\n".join(lines)
+        note + "\n\n以下為各社群平台撈到的相關討論（開頭括號標了編號與來源平台）。請『綜合』"
+        "實際有的來源消化後回答，並在敘述中自然帶出某個說法來自哪個平台：\n\n"
+        + "\n\n".join(lines) + "\n\n" + cite_rule
     )
 
 
@@ -155,17 +185,35 @@ def _stance_breakdown(issue: str, session_id: str, sources: list | None, charts:
 
     來源優先序：
       1. 這一輪 community_search 命中的 sources（順序即畫面上的 [n]）；
-      2. 這一輪沒查 → 沿用本次對話先前抓到的貼文（store）。使用者說「根據上面的結論畫個圖」
-         時模型通常不會再查一次，沒有這條路就只能回「查不到資料」——資料明明還在手邊。
+      2. 這一輪沒查 → 沿用『上一輪』抓到的貼文（store.latest）。使用者說「根據上面的結論
+         畫個圖」時模型通常不會再查一次，沒有這條路就只能回「查不到資料」——資料明明還在手邊。
     兩種情況都不重爬。
+
+    走第 2 條時多一道語意檢查：沿用的貼文必須真的在講這個 issue。同一場對話問過好幾個
+    話題時，「上一輪」不保證就是使用者現在要統計的那一輪（例：問完輝達，回頭要慈濟那題的
+    圖）。實測兩批真實貼文對「慈濟被詐騙10億這件事」的分數是——對題 0.387~0.719、
+    離題 0.163~0.355，中間有明顯空隙，故門檻取 0.35（對題全留、離題幾乎全丟）。
+    統計結果被別的話題汙染，比查不到資料更糟：那是看起來有憑有據的錯。
+
     categories：使用者指定的分類軸（同情／嘲笑／無感…）；留空＝贊成／反對／中立。
     """
     posts = list(sources or [])
     if not posts:
         try:
-            posts = store.all(session_id)      # 追問路徑（QdrantHotStore 未實作 → 當作沒有）
+            posts = store.latest(session_id)   # 追問路徑（QdrantHotStore 未實作 → 當作沒有）
         except NotImplementedError:
             posts = []
+        before = len(posts)
+        if posts:
+            posts = relevance.rerank(
+                issue, posts, settings.stance_reuse_min_score,
+                lambda p: (p.get("title") or "") + " " + (p.get("content") or "")[:300],
+                platform="stance_reuse")
+        if not posts and before:
+            return (
+                "（手邊沿用的是先前另一個話題的討論，跟這次要統計的議題不符，不能拿來充數。"
+                "請先呼叫 community_search 重查這個議題再統計；在那之前不要自己估比例、不要畫圖。）"
+            )
         if posts and sources is not None:
             # 把沿用的貼文補進這一輪的 sources：前端才列得出來源清單，
             # 圖上的 [n] 也才跟畫面上的編號對得起來。
@@ -195,7 +243,8 @@ def _stance_breakdown(issue: str, session_id: str, sources: list | None, charts:
     return (
         f"立場統計完成（議題：{issue}）。共判讀 {data['total']} 則：{counts}；比例：{percent}。{note}\n"
         "圖表已經由前端畫出來、顯示在使用者畫面上了。\n"
-        "請用『文字』說明這個分佈代表什麼、兩邊各在意什麼（可引用 [n]）。"
+        "請用『文字』說明這個分佈代表什麼、兩邊各在意什麼"
+        "（可引用貼文編號，寫成 [3] [17] 這種實際數字，不要寫成 [n]）。"
         "不要重畫圖、不要用文字符號拼圖表，也不要改動上面的數字。"
     )
 
@@ -212,4 +261,5 @@ def _crawl_dcard(board: str, query: str, session_id: str, sources: list | None =
         f"[{i + 1}] {p['title']}（{p['created_at']}）\n{p['content']}\n來源：{p['url']}"
         for i, p in enumerate(posts)
     ]
-    return "以下為站內搜尋抓到的相關討論，請據此回答並用 [n] 標注引用：\n\n" + "\n\n".join(lines)
+    return ("以下為站內搜尋抓到的相關討論，請據此回答，並在句尾標上該則的實際編號"
+            "（例如 [3]，不要寫成 [n]）：\n\n" + "\n\n".join(lines))

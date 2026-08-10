@@ -28,8 +28,10 @@ from datetime import datetime, timezone
 
 import requests
 
+from . import tracing
 from .config import settings
 from .llm import chat, embed
+from .tracing import observe
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +142,7 @@ def _store_fact(end_user_id: int, fact: str, question: str = "", answer: str = "
     ).raise_for_status()
 
 
+@observe(name="remember", capture_input=False, capture_output=False)
 def remember(end_user_id: int | None, question: str, answer: str = "",
              session_id: str = "") -> None:
     """萃取『使用者事實』後存進記憶。匿名 / 關閉 / 無事實 → 不存；fail-safe。
@@ -150,6 +153,9 @@ def remember(end_user_id: int | None, question: str, answer: str = "",
         return
     try:
         fact = _extract_fact(question)
+        # 「這題有沒有萃出事實」是記憶功能唯一的分岔點，也是使用者最常抱怨的地方
+        #（『我明明講過』）。記下有沒有寫入，才回溯得了是萃取沒抓到還是召回沒撈到。
+        tracing.set_span(input=question, output={"stored": bool(fact)})
         if not fact:
             return  # 這題沒有值得長期記住的個人事實 → 不存，避免雜訊
         _ensure_collection()
@@ -157,6 +163,7 @@ def remember(end_user_id: int | None, question: str, answer: str = "",
                     session_id=session_id, kind="turn")
     except Exception as e:  # noqa: BLE001
         logger.warning("remember failed (ignored): %s", e)
+        tracing.set_span(level="WARNING", status_message=str(e))
 
 
 def _conversation_text(messages: list[dict], max_chars: int = 4000) -> str:
@@ -303,10 +310,14 @@ def summarize_and_remember(end_user_id: int | None, messages: list[dict],
         return 0
 
 
+@observe(name="recall_facts", as_type="retriever", capture_input=False, capture_output=False)
 def recall(end_user_id: int | None, query: str) -> list[str]:
     """語意撈回這位使用者最相關的『原子事實』（kind turn/session_summary，過門檻）。匿名 / 失敗 → []。
 
     刻意排除 kind='thread'：脈絡敘事走 recall_threads() 另一條（不同門檻、不同注入區塊）。
+
+    span 只記命中數與分數，不記事實原文：同一批內容最後會出現在 build_context 記下的
+    system prompt 裡（那是唯一一份完整記錄）。個人事實沒必要在 trace 裡散落好幾份。
     """
     if not settings.user_memory_enabled or not end_user_id or not (query or "").strip():
         return []
@@ -333,12 +344,17 @@ def recall(end_user_id: int | None, query: str) -> list[str]:
             payload = h.get("payload") or {}
             if float(h.get("score", 0.0)) >= thr and payload.get("text"):
                 out.append(payload["text"])
+        tracing.set_span(input=query, output={"hits": len(hits), "kept": len(out)},
+                         metadata={"threshold": thr, "top_k": settings.user_memory_top_k,
+                                   "scores": [round(float(h.get("score", 0.0)), 3) for h in hits]})
         return out
     except Exception as e:  # noqa: BLE001
         logger.warning("recall failed (ignored): %s", e)
+        tracing.set_span(level="WARNING", status_message=str(e))
         return []
 
 
+@observe(name="recall_threads", as_type="retriever", capture_input=False, capture_output=False)
 def recall_threads(end_user_id: int | None, query: str) -> list[str]:
     """語意撈回這位使用者最相關的『對話脈絡』(kind='thread')。回 narrative 清單（截長度）。
 
@@ -372,9 +388,14 @@ def recall_threads(end_user_id: int | None, query: str) -> list[str]:
             payload = h.get("payload") or {}
             if float(h.get("score", 0.0)) >= thr and payload.get("text"):
                 out.append(payload["text"][:cap])
+        # 門檻 0.42 是不是訂得太嚴（該回顧卻沒回顧）——只有把每次的實際分數留下來才判斷得了。
+        tracing.set_span(input=query, output={"hits": len(hits), "kept": len(out)},
+                         metadata={"threshold": thr, "top_k": settings.user_thread_top_k,
+                                   "scores": [round(float(h.get("score", 0.0)), 3) for h in hits]})
         return out
     except Exception as e:  # noqa: BLE001
         logger.warning("recall_threads failed (ignored): %s", e)
+        tracing.set_span(level="WARNING", status_message=str(e))
         return []
 
 

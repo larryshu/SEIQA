@@ -74,8 +74,9 @@ class AgentSkill(models.Model):
 class SourcePlatform(models.Model):
     """一個社群來源平台（對應 sources.py 的 adapter）。"""
 
-    name = models.CharField(max_length=32, unique=True)  # dcard / ptt / mobile01 ...
-    display_name = models.CharField(max_length=64)  # Dcard 口碑庫 / PTT
+    name = models.CharField(max_length=32, unique=True)  # dcard / ptt / threads / mobile01 ...
+    # runtime 會拿它當「給 LLM 看的平台名」（sources.Source.label），不只是後台顯示用
+    display_name = models.CharField(max_length=64)  # Dcard / PTT / Threads
     adapter_key = models.CharField(max_length=64)  # runtime adapter key
     kind = models.CharField(max_length=16)  # vector / live_crawl
     is_active = models.BooleanField(default=True)

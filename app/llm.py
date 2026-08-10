@@ -1,6 +1,9 @@
 """薄薄一層 LLM 客戶端：chat()（純文字）+ chat_with_tools()（function calling）
 + chat_with_tools_stream()（同上但逐字串流，給 /ws/ask 用）。
 靠 .env 在 OpenAI / 相容端點（vLLM）與 Azure OpenAI 之間切換——與 dcard_insight 同概念。
+
+client 由 langfuse.openai 提供（見 _client），因此全站 LLM/Embedding 呼叫都會自動記錄到
+Langfuse；設計與導入階段見 docs/langfuse_observability_plan.md。
 """
 from __future__ import annotations
 
@@ -10,21 +13,29 @@ from functools import lru_cache
 
 from . import progress
 from .config import settings
+from .tracing import observe
 
 logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
 def _client():
+    """建立（並快取）LLM client。全專案唯一的建立點——含 relevance.py 那個直接借用的地方。
+
+    刻意從 langfuse.openai 匯入而非 openai：它回傳的是官方 SDK 原生的 AzureOpenAI/OpenAI
+    子類，建構參數與呼叫方式完全相同，只是每次呼叫會額外把 輸入/輸出/模型/token/耗時
+    非同步送一份到 Langfuse。因為所有 chat/embed 都經過這裡，換這兩行就等於全站上線。
+    送不出去（Langfuse 沒開）只會在背景吞掉，不影響問答——與本專案其他地方一樣 fail-safe。
+    """
     if settings.azure_endpoint:
-        from openai import AzureOpenAI
+        from langfuse.openai import AzureOpenAI
 
         return AzureOpenAI(
             api_key=settings.api_key,
             azure_endpoint=settings.azure_endpoint,
             api_version=settings.azure_api_version,
         )
-    from openai import OpenAI
+    from langfuse.openai import OpenAI
 
     kwargs = {"api_key": settings.api_key}
     if settings.base_url:
@@ -50,6 +61,7 @@ def embed(text: str) -> list[float]:
     return resp.data[0].embedding
 
 
+@observe(name="expand_queries")
 def expand_queries(question: str, n: int = 3) -> list[str]:
     """把口語問句改寫成 n 條『鄉民用詞』的檢索字串，涵蓋不同面向／同義說法。失敗回 []。
 
@@ -130,6 +142,10 @@ def chat_with_tools_stream(messages: list[dict], tools: list[dict], temperature:
         tools=tools,
         tool_choice=tool_choice,   # "none" ＝ 收尾那一刀，強制吐文字（見 chat_with_tools）
         stream=True,
+        # 串流預設不回 usage，Langfuse 只能用估算的——而這一刀正是整題最大的 token 消耗
+        # （工具結果動輒上萬字都在 prompt 裡），估錯就等於成本數字失真。要求最後補一片
+        # usage 統計。下面的迴圈本來就會跳過沒有 choices 的分片，所以那片不影響既有邏輯。
+        stream_options={"include_usage": True},
     )
     content_parts: list[str] = []
     tool_acc: dict[int, dict] = {}

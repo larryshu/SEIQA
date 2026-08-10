@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import random
 import time
 from datetime import datetime
@@ -23,7 +22,7 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
-from . import llm, progress
+from . import llm, progress, relevance
 from .config import settings
 from .crawler import Post
 
@@ -56,29 +55,6 @@ BOARDS: dict[str, str] = {
 _DEFAULT_BOARD = "Gossiping"
 
 
-# 純泛用限定詞：單獨拿去搜 PTT 標題會撈到成千上萬不相關文章（問 Kimi K3 卻回一堆
-# 「iPhone 實際照片」）。prompt 已禁，但模型不一定聽——拿回後在程式層用這張表硬過濾兜底。
-_FILLER_KEYWORDS: frozenset[str] = frozenset({
-    "實際", "心得", "評價", "看法", "推薦", "意見", "感想", "體驗", "使用", "應用",
-    "分享", "討論", "開箱", "比較", "選擇", "如何", "怎樣", "怎麼", "一般", "問題",
-    "請問", "介紹", "情況", "狀況", "效果", "表現", "優缺點", "值得", "覺得",
-})
-
-
-def _clean_keywords(keywords: list[str]) -> list[str]:
-    """剔掉純泛用限定詞（心得/實際/評價…），只留有主體的詞；去重保序。
-
-    若整批都是泛用詞（模型完全沒給實體）就退回第一個，至少還有東西可搜、不致變空。
-    """
-    seen: set[str] = set()
-    kept: list[str] = []
-    for k in keywords:
-        if k and k not in _FILLER_KEYWORDS and k not in seen:
-            seen.add(k)
-            kept.append(k)
-    return kept or keywords[:1]
-
-
 def _plan_search(query: str) -> tuple[list[str], list[str]]:
     """用一次 LLM 呼叫決定 (看板清單 1~2 個, 多個單一關鍵詞)。
 
@@ -89,7 +65,7 @@ def _plan_search(query: str) -> tuple[list[str], list[str]]:
     - 看板可能選錯，或主題本來就分散在不只一個板（例：LLM 討論在 AI_Art 也可能在 Tech_Job）——
       故讓 LLM 回 1~2 個板都搜；上層再對「0 對題結果」退回 Gossiping 當第三層網。
     - 泛用限定詞（「看法」「心得」「實際」）單獨搜會拿到大量雜訊——prompt 先禁，
-      拿回後再用 _clean_keywords 停用表硬過濾兜底。後端還有 embed cosine 二次過濾當保險。
+      拿回後再用 relevance.clean_keywords 停用表硬過濾兜底。後端還有 embed cosine 二次過濾當保險。
     失敗退回 ([Gossiping], [原問句])。
     """
     listing = "\n".join(f"- {code}: {desc}" for code, desc in BOARDS.items())
@@ -130,7 +106,7 @@ def _plan_search(query: str) -> tuple[list[str], list[str]]:
             boards.append(match)
         if len(boards) >= 2:
             break
-    return (boards or [_DEFAULT_BOARD]), (_clean_keywords(keywords) or [query])
+    return (boards or [_DEFAULT_BOARD]), (relevance.clean_keywords(keywords) or [query])
 
 
 class _Throttle:
@@ -228,45 +204,21 @@ def _parse_article(html: str) -> tuple[str, str, str]:
     return title, body, created
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    """Cosine similarity；長度為零就回 0（fail-safe）。"""
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    return dot / (na * nb) if na and nb else 0.0
-
-
 def _rerank_posts_by_similarity(user_query: str, posts: list[Post],
                                 min_score: float) -> list[Post]:
     """對抓到的 PTT posts 依語意相關度過濾——避免「看法/評價」單獨搜拿到的雜訊。
 
-    分數 = cosine(embed(user_query), embed(title + body 前段))；保留 >= min_score
-    並依分數重排。fail-safe：embed 失敗就回原 list（不擋整條爬蟲）。
-    批次一次 embed 所有 posts，只多一次 API call。
-    """
-    if not posts or not (user_query or "").strip():
-        return posts
-    try:
-        query_vec = llm.embed(user_query)
-        # title + body 前 300 字（body 常含推文雜訊，多了反而稀釋主題訊號）
-        texts = [((p.title or "") + " " + (p.content or "")[:300]).strip() or "空"
-                 for p in posts]
-        client = llm._client()  # noqa: SLF001 — 內部共用 client
-        resp = client.embeddings.create(model=settings.embed_model, input=texts)
-        vecs = [d.embedding for d in resp.data]
-    except Exception as e:  # noqa: BLE001 — 過濾失敗就沿用原結果
-        log.warning("PTT 語意過濾失敗（沿用原抓到的貼文）：%s", e)
-        return posts
+    實作在 relevance.rerank（三個平台共用）；這裡只決定「拿哪段文字去比對」：
+    title + body 前 300 字（body 常含推文雜訊，多了反而稀釋主題訊號）。
 
-    scored = [(p, _cosine(query_vec, v)) for p, v in zip(posts, vecs)]
-    kept = [(p, s) for p, s in scored if s >= min_score]
-    kept.sort(key=lambda x: x[1], reverse=True)
-    dropped = len(scored) - len(kept)
-    log.info("PTT 語意過濾：%d 篇 → %d 篇（門檻 %.2f，丟 %d）",
-             len(scored), len(kept), min_score, dropped)
-    progress.emit("ptt_rerank", kept=len(kept), dropped=dropped,
-                  threshold=min_score, before=len(scored))
-    return [p for p, _ in kept]
+    注意 p 是 TypedDict（＝dict），只能用 p.get()——舊版寫成 p.title 會拋 AttributeError
+    並被 rerank 的 except 吞掉，等於這道過濾整個沒生效（PTT_MIN_SCORE 也就從未被驗證過）。
+    """
+    return relevance.rerank(
+        user_query, posts, min_score,
+        lambda p: (p.get("title") or "") + " " + (p.get("content") or "")[:300],
+        platform="ptt",
+    )
 
 
 def _crawl_boards(sess: requests.Session, th: "_Throttle", boards: list[str],

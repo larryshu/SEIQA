@@ -101,7 +101,7 @@ class ConfigRepository:
                         })
 
                 cur.execute(
-                    "SELECT id, name, adapter_key, kind FROM source_platform "
+                    "SELECT id, name, display_name, adapter_key, kind FROM source_platform "
                     "WHERE is_active = 1 ORDER BY sort_order"
                 )
                 sources = cur.fetchall()

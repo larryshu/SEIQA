@@ -17,7 +17,8 @@ import json
 import logging
 from collections import Counter
 
-from . import llm, progress
+from . import llm, progress, tracing
+from .tracing import observe
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,7 @@ def _classify(issue: str, posts: list[dict], categories: tuple[str, ...]) -> dic
     return labels
 
 
+@observe(name="stance_breakdown", capture_input=False, capture_output=False)
 def breakdown(issue: str, posts: list[dict], categories=None) -> dict | None:
     """統計 posts 對 issue 的分佈。分不出任何一則 → None（上層就不畫圖）。
 
@@ -123,8 +125,16 @@ def breakdown(issue: str, posts: list[dict], categories=None) -> dict | None:
 
     cats = normalize(categories)
     progress.emit("stage", stage="counting", text=f"逐則判讀（{'／'.join(cats)}）：{issue}")
+    # 這一支是每題成本波動最大的地方：判讀是逐批的，貼文越多批次越多、LLM 呼叫越多次。
+    # 記下批數與則數，才對得起 trace 上那一串 generation 是從哪來的。
+    tracing.set_span(
+        input={"issue": issue, "categories": list(cats)},
+        metadata={"posts": len(posts), "batch_size": BATCH_SIZE,
+                  "batches": -(-len(posts) // BATCH_SIZE)},  # 無條件進位
+    )
     labels = _classify(issue, posts, cats)
     if not labels:
+        tracing.set_span(level="WARNING", status_message="一則都沒判讀成功，不畫圖")
         return None
 
     counts: Counter = Counter()
@@ -141,6 +151,11 @@ def breakdown(issue: str, posts: list[dict], categories=None) -> dict | None:
         })
 
     total = sum(counts.values())
+    # 判讀成功數 < posts 數＝有貼文被漏標（模型偷懶或該批 JSON 壞掉），這在畫面上看不出來，
+    # 但會讓百分比的分母悄悄變小。記下來才發現得了。
+    tracing.set_span(output={"classified": total, "posts": len(posts),
+                             "counts": {s: counts.get(s, 0) for s in cats},
+                             "low_sample": total < MIN_SAMPLE})
     return {
         "issue": issue,
         "categories": list(cats),

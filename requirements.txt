@@ -7,11 +7,13 @@ pydantic>=2.6
 streamlit>=1.33
 requests>=2.31
 beautifulsoup4>=4.12   # PTT 即時爬蟲 HTML 解析
+httpx>=0.27            # Threads 即時爬（讀 SSR JSON，免登入、不必開瀏覽器）
 DrissionPage>=4.1      # Dcard 即時爬（DCARD_MODE=live）：驅動真實 Chrome 過 Cloudflare
 playwright
 chromium
 pymysql>=1.1           # M3：runtime 唯讀讀取後台 MySQL 設定
 pyjwt>=2.10            # 終端登入：驗證 Django 簽發的 token
+langfuse>=4.0          # LLM 可觀測性：llm.py 的 client 由它包裝，全站呼叫自動上報
 # 方案 B（hot collection 持久化）要用時才裝：
 # qdrant-client>=1.9
 # redis>=5.0
