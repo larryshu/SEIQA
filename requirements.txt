@@ -14,6 +14,9 @@ chromium
 pymysql>=1.1           # M3：runtime 唯讀讀取後台 MySQL 設定
 pyjwt>=2.10            # 終端登入：驗證 Django 簽發的 token
 langfuse>=4.0          # LLM 可觀測性：llm.py 的 client 由它包裝，全站呼叫自動上報
+# 忠實度 NLI 初篩（FAITH_NLI_MODEL）要用時才裝：
+# transformers>=4.40
+# torch>=2.2
 # 方案 B（hot collection 持久化）要用時才裝：
 # qdrant-client>=1.9
 # redis>=5.0

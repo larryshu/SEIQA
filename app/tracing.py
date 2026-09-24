@@ -96,6 +96,28 @@ def score(name: str, value: float, comment: str | None = None) -> None:
         logger.debug("score 失敗（略過）：%s", e)
 
 
+def current_trace_id() -> str | None:
+    """目前的 trace id；不在 trace 裡或 Langfuse 停用時回 None。
+
+    給「要在背景執行緒補打分」的場合用（faithfulness 抽樣）：執行緒裡已經沒有目前的 span，
+    只能先在請求執行緒把 id 取出來帶過去，再用 score_trace 指名回寫。
+    """
+    try:
+        return get_client().get_current_trace_id()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("current_trace_id 失敗（略過）：%s", e)
+        return None
+
+
+def score_trace(trace_id: str, name: str, value: float, comment: str | None = None) -> None:
+    """對指定的 trace 打分（score 的「不依賴目前 context」版本）。"""
+    try:
+        get_client().create_score(trace_id=trace_id, name=name, value=value,
+                                  comment=comment, data_type="NUMERIC")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("score_trace 失敗（略過）：%s", e)
+
+
 def get_prompt(name: str, fallback: str, label: str = "production",
                ttl_seconds: int = 60) -> tuple[str, str]:
     """從 Langfuse 拉 prompt，回 (內容, 版本標記)。連不上就回 (fallback, "fallback")。

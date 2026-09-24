@@ -17,8 +17,8 @@ from fastapi import FastAPI, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import (agent, audit, dcard_live, memory_store, progress, suggest, tracing, user_memory,
-               user_preference)
+from . import (agent, audit, dcard_live, faithfulness, memory_store, progress, suggest, tracing,
+               user_memory, user_preference)
 from .agent import run
 from .auth import end_user_id_from_token
 from .config import settings
@@ -156,6 +156,8 @@ def ask(req: AskReq, authorization: str | None = Header(default=None)) -> AskRes
         user_memory.remember(end_user_id, req.message, result["answer"], session_id=req.session_id)
         # 反幻覺規定的自動稽核：純字串比對、不呼叫 LLM，結果以 score 掛在這個 trace 上
         audit.audit_and_score(result["answer"], result.get("sources"), result.get("used_tools"))
+        # 忠實度抽樣（語意層：原文是否支持論點）：依 FAITH_SAMPLE_RATE 抽題、背景跑，不拖慢回應
+        faithfulness.maybe_score_async(result["answer"], result.get("sources"))
         tracing.set_trace_io(input=req.message, output=result["answer"])
         return AskResp(answer=result["answer"], used_tools=result["used_tools"], sources=sources,
                        chart=result.get("chart"))
@@ -318,6 +320,7 @@ def _run_blocking_inner(question: str, history: list[dict], session_id: str,
     user_memory.remember(end_user_id, question, result["answer"], session_id=session_id)
     # 與 /ask 同一套稽核（見該處註解）。放在 emit done 之前也無妨——純字串比對，微秒等級。
     audit.audit_and_score(result["answer"], sources, result.get("used_tools"))
+    faithfulness.maybe_score_async(result["answer"], sources)  # 同 /ask：抽樣、背景執行
     # 追問建議：依這一輪問答產生幾個 follow-up（fail-safe，產不出來就回 []）。
     # 只在 done 這條路徑做；cancelled/error 不做。放這裡＝晚 ~1s，但答案文字早已串流完。
     # memories：agent 這輪已撈回的使用者事實，直接沿用（suggest 不再搜一次——同 query 結果一樣，

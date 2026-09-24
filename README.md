@@ -497,6 +497,12 @@ USER_THREAD_MAX_CHARS=1200          # 單筆敘事注入 prompt 的長度上限
 PREF_INFER_ENABLED=true              # 關掉即不自動推論偏好
 PREF_INFER_MIN_CONFIDENCE=0.75       # 只有信心 >= 此值才寫入（越高越保守）
 
+# --- 忠實度量測（被引用的原文是否支持論點；見 app/faithfulness.py）---
+FAITH_SAMPLE_RATE=0                  # 線上抽樣率，0＝關閉；例 0.1＝抽一成題目在背景評分（多一次 LLM 呼叫）
+FAITH_SOURCE_CHARS=1500              # 每則原文交給 judge 的長度上限
+FAITH_NLI_MODEL=                     # 選配 NLI 初篩（需另裝 transformers torch）；留空＝全交 LLM
+FAITH_NLI_PASS=0.9                   # NLI 蘊含機率 >= 此值才直接放行
+
 # --- 後台 MySQL 整合（DB_HOST 留空＝停用整合，只跑 runtime）---
 DB_HOST=127.0.0.1 / DB_NAME=crawl_agent
 DB_USER=crawl_ro   / DB_PASSWORD=...      # 唯讀帳號（讀設定 / 偏好）

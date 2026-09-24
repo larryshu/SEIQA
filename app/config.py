@@ -70,6 +70,17 @@ class Settings:
         "PREF_INFER_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
     pref_infer_min_confidence: float = _float("PREF_INFER_MIN_CONFIDENCE", 0.75)
 
+    # ---- 忠實度量測（faithfulness.py：被引用的原文是否支持論點）----
+    # 線上抽樣率：0＝關閉。每抽中一題多一次 LLM 呼叫（背景執行，不影響回應時間），開多少由人決定。
+    faith_sample_rate: float = _float("FAITH_SAMPLE_RATE", 0.0)
+    # 交給 judge 的每則原文截斷長度：貼文動輒數千字，全塞進去又貴又稀釋注意力。
+    faith_source_chars: int = _int("FAITH_SOURCE_CHARS", 1500)
+    # NLI 初篩（選配，需另裝 transformers + torch）：留空＝不用，全交 LLM。
+    # 建議 MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7（多語、含中文）。
+    faith_nli_model: str = os.environ.get("FAITH_NLI_MODEL", "").strip()
+    # NLI 蘊含機率 >= 此值才直接放行；訂得高是因為 NLI 讀不懂反諷，只讓它放行「很有把握」的。
+    faith_nli_pass: float = _float("FAITH_NLI_PASS", 0.9)
+
     # ---- Dcard 口碑庫（唯讀查詢；資料由 dcard_insight 專案批次建好，這裡只查不寫）----
     insight_collection: str = os.environ.get("INSIGHT_COLLECTION", "dcard_insight").strip()
     search_top_k: int = _int("SEARCH_TOP_K", 5)  # 向量檢索回傳幾則（去重後的貼文數）
