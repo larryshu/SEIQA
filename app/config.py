@@ -76,9 +76,11 @@ class Settings:
         "AUDIT_RETRY_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
     # ---- 跨平台重排（reranker.py：三平台合併後依相關度重排、只留前 N 則）----
-    # 預設關：會改變送進回答模型的貼文，要先用 dataset 評測 A/B 確認有效再開。
+    # 預設開，依據是 dataset 評測 A/B（9 題，2026-09-24）：faithfulness 100% → 100%、
+    # 送進回答模型的字數 −64%、耗時 +3%；論點數 −30%，人工比對確認少掉的是離題內容，
+    # 答案沒有變單薄。要關就設 RERANK_ENABLED=false。
     rerank_enabled: bool = os.environ.get(
-        "RERANK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+        "RERANK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
     rerank_backend: str = os.environ.get("RERANK_BACKEND", "llm").strip().lower()  # llm | cross_encoder
     rerank_model: str = os.environ.get("RERANK_MODEL", "").strip()  # 留空＝CHAT_MODEL；可指定便宜模型
     rerank_top_n: int = _int("RERANK_TOP_N", 30)                    # 最多留幾則；不超過這數量就不重排

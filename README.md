@@ -498,7 +498,7 @@ PREF_INFER_ENABLED=true              # 關掉即不自動推論偏好
 PREF_INFER_MIN_CONFIDENCE=0.75       # 只有信心 >= 此值才寫入（越高越保守）
 
 # --- 跨平台重排（三平台合併後依相關度重排、只留前 N 則；見 app/reranker.py）---
-RERANK_ENABLED=false                 # 預設關；用 dataset 評測 A/B 確認有效再開
+RERANK_ENABLED=true                  # A/B：送進 LLM 的字數 −64%、faithfulness 持平；要關設 false
 RERANK_BACKEND=llm                   # llm（分批請 LLM 打 0～3 分）｜cross_encoder（預留，需 torch）
 RERANK_MODEL=                        # 打分用的模型，留空＝CHAT_MODEL；可指定便宜模型
 RERANK_TOP_N=30                      # 最多留幾則；來源不超過此數就不重排

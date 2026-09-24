@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -118,9 +119,15 @@ def run_dataset(run_name: str | None) -> None:
 
     def task(*, item, **_) -> dict:
         q = item.input["question"] if isinstance(item.input, dict) else str(item.input)
+        started = time.monotonic()
         r = agent.run(q, history=[], session_id=f"faith-eval-{_item_id(q)}", end_user_id=None)
+        # 成本的代理指標：工具回傳給 LLM 的總字數（貼文全文都在這裡，是每題最大的 token 來源）。
+        # 不直接讀 token 用量：那要回頭查 Langfuse，而它在負載高時會漏收 span。
+        tool_chars = sum(len(m.get("content") or "") for m in r.get("messages", [])
+                         if isinstance(m, dict) and m.get("role") == "tool")
         # sources 只留評分用得到的欄位；content 必須留，judge 要讀原文
         return {"answer": r["answer"], "chart": r.get("chart"),
+                "elapsed": round(time.monotonic() - started, 1), "tool_chars": tool_chars,
                 "sources": [{k: s.get(k, "") for k in ("title", "url", "content", "source")}
                             for s in r.get("sources", [])]}
 
@@ -139,12 +146,26 @@ def run_dataset(run_name: str | None) -> None:
         data=client.get_dataset(DATASET).items, task=task, evaluators=[faithfulness],
         max_concurrency=1,
     )
-    rows = []
+    from app.config import settings
+
+    rows, per_q = [], []
     for r in getattr(result, "item_results", []) or []:
         q = r.item.input["question"] if isinstance(r.item.input, dict) else r.item.input
         out = r.output or {}
-        rows.append((q, done.get(out.get("answer", "")) or fa.Result(error="task 失敗")))
+        res = done.get(out.get("answer", "")) or fa.Result(error="task 失敗")
+        rows.append((q, res))
+        if out:
+            per_q.append((q, out.get("elapsed", 0), len(out.get("sources", [])),
+                          out.get("tool_chars", 0), len(res.claims)))
+    print(f"\nRERANK_ENABLED={settings.rerank_enabled}")
     _report(rows)
+    if per_q:
+        print("\n每題：耗時 / 來源數 / 送進 LLM 的字數 / 論點數")
+        for q, sec, n_src, chars, n_claims in per_q:
+            print(f"  {sec:>6.0f}s  {n_src:>4}  {chars:>7,}  {n_claims:>3}  {q[:30]}")
+        k = len(per_q)
+        print(f"  平均：{sum(x[1] for x in per_q) / k:.0f}s、{sum(x[2] for x in per_q) / k:.1f} 則、"
+              f"{sum(x[3] for x in per_q) / k:,.0f} 字、{sum(x[4] for x in per_q) / k:.1f} 個論點")
     print(f"\nLangfuse → Datasets → {DATASET} → Runs 可跨 run 比較")
     client.flush()
 
