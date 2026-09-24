@@ -75,6 +75,16 @@ class Settings:
     audit_retry_enabled: bool = os.environ.get(
         "AUDIT_RETRY_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
+    # ---- 跨平台重排（reranker.py：三平台合併後依相關度重排、只留前 N 則）----
+    # 預設關：會改變送進回答模型的貼文，要先用 dataset 評測 A/B 確認有效再開。
+    rerank_enabled: bool = os.environ.get(
+        "RERANK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    rerank_backend: str = os.environ.get("RERANK_BACKEND", "llm").strip().lower()  # llm | cross_encoder
+    rerank_model: str = os.environ.get("RERANK_MODEL", "").strip()  # 留空＝CHAT_MODEL；可指定便宜模型
+    rerank_top_n: int = _int("RERANK_TOP_N", 30)                    # 最多留幾則；不超過這數量就不重排
+    rerank_min_score: float = _float("RERANK_MIN_SCORE", 2.0)       # 0～3 分，低於此分不補位
+    rerank_per_platform_min: int = _int("RERANK_PER_PLATFORM_MIN", 3)  # 每個平台至少保留幾則（>0 分）
+
     # ---- 忠實度量測（faithfulness.py：被引用的原文是否支持論點）----
     # 線上抽樣率：0＝關閉。每抽中一題多一次 LLM 呼叫（背景執行，不影響回應時間），開多少由人決定。
     faith_sample_rate: float = _float("FAITH_SAMPLE_RATE", 0.0)

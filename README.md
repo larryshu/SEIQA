@@ -497,6 +497,14 @@ USER_THREAD_MAX_CHARS=1200          # 單筆敘事注入 prompt 的長度上限
 PREF_INFER_ENABLED=true              # 關掉即不自動推論偏好
 PREF_INFER_MIN_CONFIDENCE=0.75       # 只有信心 >= 此值才寫入（越高越保守）
 
+# --- 跨平台重排（三平台合併後依相關度重排、只留前 N 則；見 app/reranker.py）---
+RERANK_ENABLED=false                 # 預設關；用 dataset 評測 A/B 確認有效再開
+RERANK_BACKEND=llm                   # llm（分批請 LLM 打 0～3 分）｜cross_encoder（預留，需 torch）
+RERANK_MODEL=                        # 打分用的模型，留空＝CHAT_MODEL；可指定便宜模型
+RERANK_TOP_N=30                      # 最多留幾則；來源不超過此數就不重排
+RERANK_MIN_SCORE=2                   # 低於此分不補位（實測 1 分多為只沾到關鍵字的離題文）
+RERANK_PER_PLATFORM_MIN=3            # 每個平台至少保留幾則（>0 分），避免某平台整批被刷掉
+
 # --- 答案稽核違規時自動重寫（只用在非串流的 /ask；串流版答案已送出，維持只記分）---
 AUDIT_RETRY_ENABLED=true             # 違規才多一次 LLM 呼叫；仍違規就機械式清掉假引用與字元圖表
 

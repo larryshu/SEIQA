@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import NamedTuple
 
-from . import llm, progress, ptt, tracing, vectorstore
+from . import llm, progress, ptt, reranker, tracing, vectorstore
 from .config import settings
 from .config_repo import repo
 from .crawler import Post
@@ -247,6 +247,11 @@ def community_search(query: str, end_user_id: int | None = None) -> SearchResult
         # 取消時不等在途的爬蟲：DrissionPage 是阻塞的、無法從外部中斷，只能不再等它。
         # 那顆 Chrome 會自己跑到時間預算結束後收工，結果丟棄。
         executor.shutdown(wait=False, cancel_futures=True)
+
+    # 合併後才重排：這裡是三個平台唯一的匯流點，而且還沒編號——之後的 [n]、
+    # 「哪些平台有資料」的提示、立場統計，全都自動用重排後的結果。關閉時原樣返回。
+    progress.raise_if_cancelled()
+    results = reranker.rerank(query, results)
 
     counts: dict[str, int] = {}
     for post in results:

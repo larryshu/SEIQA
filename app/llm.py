@@ -43,10 +43,10 @@ def _client():
     return OpenAI(**kwargs)
 
 
-def chat(messages: list[dict], temperature: float = 0.2) -> str:
-    """純文字補全：不掛工具。"""
+def chat(messages: list[dict], temperature: float = 0.2, model: str | None = None) -> str:
+    """純文字補全：不掛工具。model 留空＝settings.chat_model（重排這類量大的雜事可指定便宜模型）。"""
     resp = _client().chat.completions.create(
-        model=settings.chat_model, temperature=temperature, messages=messages
+        model=model or settings.chat_model, temperature=temperature, messages=messages
     )
     return resp.choices[0].message.content or ""
 
