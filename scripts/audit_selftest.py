@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.audit import audit  # noqa: E402
+from app.audit import audit, repair  # noqa: E402
 
 SRC3 = [{"source": "dcard"}, {"source": "ptt"}, {"source": "dcard"}]
 
@@ -53,8 +53,26 @@ CASES: list[tuple[str, str, list[dict], list[str], set[str]]] = [
 ]
 
 
+# repair()：(說明, 答案, 來源數, 預期結果)。只刪「刪了也不改變意思」的部分。
+REPAIR_CASES: list[tuple[str, str, int, str]] = [
+    ("刪字面 [n]", "很多人覺得太慢 [n]。", 3, "很多人覺得太慢。"),
+    ("刪超出範圍的編號、留合法的", "有人說很棒 [2]，也有人說很爛 [7]。", 3,
+     "有人說很棒 [2]，也有人說很爛。"),
+    ("刪字元圖表那幾行", "分佈如下：\n贊成 ████\n反對 ██████\n整體偏反對 [1]。", 3,
+     "分佈如下：\n整體偏反對 [1]。"),
+    ("比例句不動（要改寫、不能硬刪）", "大概六成的人反對 [1]。", 3, "大概六成的人反對 [1]。"),
+]
+
+
 def main() -> int:
     failures = 0
+    for label, answer, n, expected in REPAIR_CASES:
+        got = repair(answer, n)
+        ok = got == expected
+        print(f"{'OK  ' if ok else 'FAIL'} repair｜{label}")
+        if not ok:
+            failures += 1
+            print(f"       預期 {expected!r}\n       實得 {got!r}")
     for label, answer, sources, tools, expected in CASES:
         got = {f.rule for f in audit(answer, sources, tools) if not f.passed}
         ok = got == expected
@@ -68,7 +86,8 @@ def main() -> int:
                 print(f"       漏抓：{sorted(missed)}")
             if extra:
                 print(f"       誤報：{sorted(extra)}   ← 這種比漏抓嚴重")
-    print(f"\n{len(CASES) - failures}/{len(CASES)} 通過")
+    total = len(CASES) + len(REPAIR_CASES)
+    print(f"\n{total - failures}/{total} 通過")
     return 1 if failures else 0
 
 

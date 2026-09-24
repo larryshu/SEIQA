@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from . import llm, progress, tracing, user_memory
+from . import audit, llm, progress, tracing, user_memory
 from .config import settings
 from .config_repo import repo
 from .llm import chat_with_tools
@@ -270,6 +270,47 @@ def _build_context(user_message: str, history: list[dict] | None,
     )
 
 
+def _audit_retry(ctx: "_RunContext", messages: list[dict], answer: str,
+                 sources: list[dict], used_tools: list[str]) -> str:
+    """答案違反 audit.py 的規則時，把違規項目告訴模型、請它重寫一次。只用在非串流的 run()。
+
+    為什麼串流版不做：串流的答案在稽核之前已經一個字一個字送到使用者畫面上了，
+    事後重寫等於當著使用者的面換掉整段字，體驗比留著一個小違規更糟。串流版維持只記分。
+
+    只重試一次：重寫後違規變少才採用（變多或一樣就留原答案，重寫不保證變好）；
+    最後再用 audit.repair 機械式清掉刪了也不影響語意的部分（假引用、字元圖表）。
+    違規之後才會多一次 LLM 呼叫，正常答案零成本。
+    """
+    if not settings.audit_retry_enabled:
+        return answer
+    failed = [f for f in audit.audit(answer, sources, used_tools) if not f.passed]
+    if not failed:
+        return answer
+
+    chosen, after = answer, failed
+    try:
+        msg = chat_with_tools(
+            messages + [{"role": "assistant", "content": answer},
+                        {"role": "system", "content": audit.fix_instructions(failed, len(sources))}],
+            ctx.tools, temperature=ctx.temperature, model=ctx.model, tool_choice="none")
+        retried = msg.content or ""
+        retry_failed = [f for f in audit.audit(retried, sources, used_tools) if not f.passed]
+        if retried and len(retry_failed) < len(failed):
+            chosen, after = retried, retry_failed
+    except Exception as e:  # noqa: BLE001 — 重寫失敗就用原答案，不可以弄死回答
+        logger.warning("稽核重寫失敗（沿用原答案）：%s", e)
+
+    if after:
+        chosen = audit.repair(chosen, len(sources))
+    left = [f.rule for f in audit.audit(chosen, sources, used_tools) if not f.passed]
+    # 記下「原本違規了什麼、修完還剩什麼」。api 那邊的 audit_pass 評的是修正後的答案，
+    # 沒有這一筆就看不出模型本身的違規率——修正機制會把問題藏起來。
+    tracing.score("audit_retry", 0.0 if left else 1.0,
+                  comment=f"原違規：{'、'.join(f.rule for f in failed)}"
+                          + (f"；修正後仍有：{'、'.join(left)}" if left else "；已全部修正"))
+    return chosen
+
+
 @observe(name="agent_loop", capture_input=False, capture_output=False)
 def run(user_message: str, history: list[dict] | None = None, session_id: str = "default",
         end_user_id: int | None = None) -> dict:
@@ -288,9 +329,10 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
     for _ in range(ctx.max_rounds):
         msg = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model)
         if not msg.tool_calls:
-            messages.append({"role": "assistant", "content": msg.content or ""})
-            _finish_span(user_message, msg.content or "", used_tools, sources)
-            return {"answer": msg.content or "", "used_tools": used_tools, "sources": sources,
+            answer = _audit_retry(ctx, messages, msg.content or "", sources, used_tools)
+            messages.append({"role": "assistant", "content": answer})
+            _finish_span(user_message, answer, used_tools, sources)
+            return {"answer": answer, "used_tools": used_tools, "sources": sources,
                     "chart": charts[-1] if charts else None, "messages": messages,
                     "memories": ctx.memories}
 
@@ -311,6 +353,7 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
     final = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model,
                             tool_choice="none")
     answer = final.content or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
+    answer = _audit_retry(ctx, messages, answer, sources, used_tools)
     messages.append({"role": "assistant", "content": answer})
     _finish_span(user_message, answer, used_tools, sources)
     return {"answer": answer, "used_tools": used_tools, "sources": sources,

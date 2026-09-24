@@ -497,6 +497,9 @@ USER_THREAD_MAX_CHARS=1200          # 單筆敘事注入 prompt 的長度上限
 PREF_INFER_ENABLED=true              # 關掉即不自動推論偏好
 PREF_INFER_MIN_CONFIDENCE=0.75       # 只有信心 >= 此值才寫入（越高越保守）
 
+# --- 答案稽核違規時自動重寫（只用在非串流的 /ask；串流版答案已送出，維持只記分）---
+AUDIT_RETRY_ENABLED=true             # 違規才多一次 LLM 呼叫；仍違規就機械式清掉假引用與字元圖表
+
 # --- 忠實度量測（被引用的原文是否支持論點；見 app/faithfulness.py）---
 FAITH_SAMPLE_RATE=0                  # 線上抽樣率，0＝關閉；例 0.1＝抽一成題目在背景評分（多一次 LLM 呼叫）
 FAITH_SOURCE_CHARS=1500              # 每則原文交給 judge 的長度上限

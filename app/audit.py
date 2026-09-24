@@ -123,6 +123,35 @@ def audit(answer: str, sources: list[dict] | None = None,
     ]
 
 
+_FIX_HINTS = {
+    "literal_n": "答案裡出現了字面的「[n]」。請改成實際的來源編號，或拿掉那個標註。",
+    "citation_range": "有引用編號超出範圍（本次來源只有 1～{n} 則）。只能引用這個範圍內、內容確實支持該句的編號。",
+    "phantom_platform": "提到了這次沒有撈到資料的平台。沒有資料的平台完全不要提。",
+    "unsourced_percent": "這次沒有做立場統計，答案卻出現百分比或成數。請改用「不少人」「有人」這類描述，不要給比例。",
+    "ascii_chart": "答案裡用字元拼出了圖表。請拿掉，圖表由前端負責。",
+}
+
+
+def fix_instructions(failed: list[Finding], n_sources: int) -> str:
+    """把違規項目寫成給模型的修正指示（重生成那一次用）。"""
+    lines = [f"- {_FIX_HINTS[f.rule].format(n=n_sources)}（{f.detail}）"
+             for f in failed if f.rule in _FIX_HINTS]
+    return ("你剛才的回答違反了以下規定，請修正後重新輸出『完整的回答』"
+            "（內容與語氣維持原樣，只改違規的地方；不要解釋你改了什麼）：\n" + "\n".join(lines))
+
+
+def repair(answer: str, n_sources: int) -> str:
+    """機械式修掉「刪了也不會改變意思」的違規：字面 [n]、超出範圍的編號、字元圖表的那幾行。
+
+    重生成之後仍違規時的最後一道。phantom_platform 與 unsourced_percent 不在這裡處理——
+    那要改寫句子，硬刪會把句子刪成語意不通，寧可留著讓稽核分數記下來。
+    """
+    text = _LITERAL_N.sub("", answer or "")
+    text = _CITATION.sub(lambda m: m.group(0) if 1 <= int(m.group(1)) <= n_sources else "", text)
+    text = "\n".join(ln for ln in text.split("\n") if not _ASCII_CHART.search(ln))
+    return re.sub(r"[ \t]+([，。！？、；])", r"\1", text).strip()
+
+
 def audit_and_score(answer: str, sources: list[dict] | None = None,
                     used_tools: list[str] | None = None) -> list[Finding]:
     """跑稽核並把結果打成 Langfuse score 掛在目前的 trace 上。fail-safe。
