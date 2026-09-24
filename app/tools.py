@@ -198,7 +198,8 @@ def _stance_breakdown(issue: str, session_id: str, sources: list | None, charts:
     categories：使用者指定的分類軸（同情／嘲笑／無感…）；留空＝贊成／反對／中立。
     """
     posts = list(sources or [])
-    if not posts:
+    reused = not posts
+    if reused:
         try:
             posts = store.latest(session_id)   # 追問路徑（QdrantHotStore 未實作 → 當作沒有）
         except NotImplementedError:
@@ -246,6 +247,32 @@ def _stance_breakdown(issue: str, session_id: str, sources: list | None, charts:
         "請用『文字』說明這個分佈代表什麼、兩邊各在意什麼"
         "（可引用貼文編號，寫成 [3] [17] 這種實際數字，不要寫成 [n]）。"
         "不要重畫圖、不要用文字符號拼圖表，也不要改動上面的數字。"
+        + (_reused_post_list(data, posts) if reused else "")
+    )
+
+
+def _reused_post_list(data: dict, posts: list) -> str:
+    """沿用上一輪貼文時，把『重新編號後』的貼文清單交給 LLM。
+
+    沿用路徑這一輪沒有跑 community_search，LLM 手上沒有任何編號過的原文，卻被要求引用
+    [n]——它只能憑上一輪答案裡的編號亂套。偏偏沿用的貼文又經過相關度重排、從 [1] 重新
+    編號，舊編號對過來全是別的貼文（實測：「慈濟被詐騙」的論點引用到台灣大哥大調薪文）。
+    faithfulness 基準線上分數最低的幾題全是這條路徑，引用對不上原文。
+
+    每則只給立場、判讀依據與開頭一小段：夠 LLM 說明「兩邊各在意什麼」並引用得準，
+    又不必把上百則全文再塞一次。
+    """
+    by_n = {it["n"]: it for it in data.get("items", [])}
+    lines = []
+    for n, p in enumerate(posts, 1):
+        it = by_n.get(n)
+        stance_tag = f"｜{it['stance']}：{it['why']}" if it else ""
+        excerpt = " ".join((p.get("content") or "").split())[:100]
+        lines.append(f"[{n}]（{p.get('source', '')}）{p.get('title', '')}{stance_tag}\n{excerpt}")
+    return (
+        "\n\n【本輪貼文清單——引用只能用這裡的編號】這一輪沿用先前撈到的貼文，已重新編號為 "
+        f"1～{len(posts)}。**先前回答裡出現過的 [n] 在這一輪全部失效，不可沿用。**"
+        "引用時只能標下面清單裡、內容確實支持該說法的那一則：\n\n" + "\n".join(lines)
     )
 
 
