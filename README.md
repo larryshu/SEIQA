@@ -502,7 +502,8 @@ AUDIT_RETRY_ENABLED=true             # 違規才多一次 LLM 呼叫；仍違規
 
 # --- 忠實度量測（被引用的原文是否支持論點；見 app/faithfulness.py）---
 FAITH_SAMPLE_RATE=0                  # 線上抽樣率，0＝關閉；例 0.1＝抽一成題目在背景評分（多一次 LLM 呼叫）
-FAITH_SOURCE_CHARS=1500              # 每則原文交給 judge 的長度上限
+FAITH_SOURCE_CHARS=1500              # 每則原文交給 judge 的最短長度
+FAITH_SOURCE_BUDGET=30000            # 原文總預算，平均分給被引用的幾則（單則上限 8000）
 FAITH_NLI_MODEL=                     # 選配 NLI 初篩（需另裝 transformers torch）；留空＝全交 LLM
 FAITH_NLI_PASS=0.9                   # NLI 蘊含機率 >= 此值才直接放行
 

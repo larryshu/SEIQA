@@ -81,7 +81,7 @@ def run_history(limit: int) -> None:
         with conn.cursor() as cur:
             # 每則答案配它前一則（同對話）的使用者問題，報表才看得懂是哪一題
             cur.execute(
-                "SELECT a.content, a.sources, "
+                "SELECT a.content, a.sources, a.chart, "
                 "  (SELECT u.content FROM message u WHERE u.conversation_id = a.conversation_id "
                 "     AND u.role = 'user' AND u.id < a.id ORDER BY u.id DESC LIMIT 1) "
                 "FROM message a WHERE a.role = 'assistant' "
@@ -92,11 +92,12 @@ def run_history(limit: int) -> None:
         conn.close()
 
     results = []
-    for i, (answer, sources, question) in enumerate(rows, 1):
+    for i, (answer, sources, chart, question) in enumerate(rows, 1):
         srcs = json.loads(sources) if isinstance(sources, str) else (sources or [])
+        chart = json.loads(chart) if isinstance(chart, str) else chart  # 占比題才有
         q = question or "（找不到對應問題）"
         print(f"[{i}/{len(rows)}] {q[:40]}", flush=True)
-        results.append((q, fa.evaluate(answer or "", srcs)))
+        results.append((q, fa.evaluate(answer or "", srcs, chart)))
     _report(results)
 
 
@@ -119,14 +120,15 @@ def run_dataset(run_name: str | None) -> None:
         q = item.input["question"] if isinstance(item.input, dict) else str(item.input)
         r = agent.run(q, history=[], session_id=f"faith-eval-{_item_id(q)}", end_user_id=None)
         # sources 只留評分用得到的欄位；content 必須留，judge 要讀原文
-        return {"answer": r["answer"],
+        return {"answer": r["answer"], "chart": r.get("chart"),
                 "sources": [{k: s.get(k, "") for k in ("title", "url", "content", "source")}
                             for s in r.get("sources", [])]}
 
     done: dict[str, fa.Result] = {}  # 答案 → 評分結果；報表直接沿用，不再多打一次 judge
 
     def faithfulness(*, output, **_):
-        res = done[output["answer"]] = fa.evaluate(output["answer"], output["sources"])
+        res = done[output["answer"]] = fa.evaluate(output["answer"], output["sources"],
+                                                   output.get("chart"))
         if res.error or res.score is None:
             return []  # 沒論點或 judge 失敗：不給分，免得把 0 或 1 灌進平均
         return Evaluation(name="faithfulness", value=res.score, data_type="NUMERIC",

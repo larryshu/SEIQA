@@ -106,9 +106,21 @@ def extract_claims(answer: str) -> list[Claim]:
     return out
 
 
-def _source_text(src: dict) -> str:
+def _source_text(src: dict, limit: int | None = None) -> str:
     body = f"{src.get('title') or ''}\n{src.get('content') or ''}".strip()
-    return body[:settings.faith_source_chars]
+    return body[:limit or settings.faith_source_chars]
+
+
+def _per_source_limit(n_cited: int) -> int:
+    """每則原文給 judge 讀多長：總預算平均分給這次被引用的幾則，下限 FAITH_SOURCE_CHARS。
+
+    固定截 1500 字會誤判：回答的模型讀的是全文，judge 卻只讀前段——實測「福智教育園區」
+    那題，論點講的「出家」「證照」「階級制度」全在第 1700～2000 字，兩個論點因此被判
+    not_found。引用只有一兩則時多讀一點很便宜；占比題一次引用二三十則時則維持短版，
+    免得 prompt 暴增。
+    """
+    return max(settings.faith_source_chars,
+               min(8000, settings.faith_source_budget // max(n_cited, 1)))
 
 
 # ---- 3) NLI 初篩（選配）------------------------------------------------------
@@ -161,30 +173,58 @@ _JUDGE_SYSTEM = (
     "（例如「真的是『好』棒棒」多半是在酸）。\n"
     "- 不要因為量詞扣分：「有人」「不少人」「網友」這類概括說法，只要原文方向吻合就算 supported。\n"
     "- 只看被引用的那幾則，不要用你自己的常識補。\n"
-    "- evidence 請逐字摘錄原文中最關鍵的一句；not_found 時給空字串。\n"
+    # 限長是實測踩到的：論點一次引用 25 則時，judge 會把十幾段原文全串進 evidence，
+    # 輸出長到 JSON 被截斷、整批解析失敗。依據只要能讓人回頭查證就夠，一句就好。
+    "- evidence 只摘錄原文中最關鍵的『一句』，60 字以內；not_found 時給空字串。\n"
     "只輸出 JSON，不要 markdown：\n"
     "{\"results\":[{\"id\":1,\"verdict\":\"supported|contradicted|not_found\",\"evidence\":\"...\"}]}"
 )
 
 
+_TRAILING_COMMA = re.compile(r",\s*([\]}])")
+
+
 def _parse_json(raw: str) -> dict:
+    """容錯解析 judge 的 JSON：去 markdown 圍籬、只取最外層 {…}、去掉結尾多餘的逗號。
+
+    結尾逗號是實測踩到的：論點多時模型常回 `{…},\\n]}`，約每三次壞一次，
+    整批判定就因此作廢。這種壞法不影響內容，修掉再解析即可。
+    """
     s = (raw or "").strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        s = s[s.find("{"):] if "{" in s else s
-    return json.loads(s)
+    if "{" in s and "}" in s:
+        s = s[s.find("{"):s.rfind("}") + 1]
+    return json.loads(_TRAILING_COMMA.sub(r"\1", s))
+
+
+def _chart_note(chart: dict | None) -> str:
+    """把這一輪 stance_breakdown 的統計結果寫成給 judge 的背景說明；沒有統計就回空字串。
+
+    為什麼需要：占比題的答案會寫「只有一成多的人適應良好 [4][9]」——比例是程式數出來的，
+    本來就不在任何一則貼文裡。不告訴 judge，它會把整句判成 not_found，
+    於是每一題占比題都被系統性地低估（第一次實測就是這樣：唯一的「不支持」正是這種句子）。
+    """
+    if not chart or not chart.get("percent"):
+        return ""
+    percent = "、".join(f"{k} {v}%" for k, v in chart["percent"].items())
+    return (
+        f"\n\n【本題另有程式統計的立場分佈】共判讀 {chart.get('total', '?')} 則：{percent}。"
+        "論點中的百分比或成數若與這份統計相符（允許「一成多」「將近一半」這類約略說法），"
+        "比例本身視為有依據，不必在原文中找；只判斷論點其餘的描述是否被引用的原文支持。"
+        "比例與統計明顯不符時，判 contradicted。"
+    )
 
 
 @observe(name="faithfulness_judge", as_type="evaluator", capture_input=False)
-def _judge(claims: list[Claim], sources: list[dict]) -> None:
+def _judge(claims: list[Claim], sources: list[dict], chart: dict | None = None) -> None:
     """把 claims 一次交給 LLM 判斷，結果直接寫回每個 Claim。失敗就拋，由呼叫端決定怎麼處理。"""
     cited = sorted({n for c in claims for n in c.cites})
-    src_block = "\n\n".join(f"[{n}] {_source_text(sources[n - 1])}" for n in cited)
+    limit = _per_source_limit(len(cited))
+    src_block = "\n\n".join(f"[{n}] {_source_text(sources[n - 1], limit)}" for n in cited)
     claim_block = "\n".join(
         f"{i}. {c.text}（引用：{'、'.join(f'[{n}]' for n in c.cites)}）"
         for i, c in enumerate(claims, 1))
     raw = chat([
-        {"role": "system", "content": _JUDGE_SYSTEM},
+        {"role": "system", "content": _JUDGE_SYSTEM + _chart_note(chart)},
         {"role": "user", "content": f"【原文】\n{src_block}\n\n【論點】\n{claim_block}"},
     ], temperature=0.0)
     results = {int(r["id"]): r for r in _parse_json(raw).get("results", [])
@@ -199,8 +239,12 @@ def _judge(claims: list[Claim], sources: list[dict]) -> None:
 
 
 # ---- 5) 組起來 ---------------------------------------------------------------
-def evaluate(answer: str, sources: list[dict] | None) -> Result:
-    """評一題。不呼叫 Langfuse score，純回傳結果（離線評測與線上抽樣共用）。"""
+def evaluate(answer: str, sources: list[dict] | None, chart: dict | None = None) -> Result:
+    """評一題。不呼叫 Langfuse score，純回傳結果（離線評測與線上抽樣共用）。
+
+    chart：這一輪 stance_breakdown 的統計結果（有做立場統計才有），交給 judge 當背景，
+    讓答案裡由程式算出的比例不被誤判成無中生有。見 _chart_note。
+    """
     sources = sources or []
     result = Result(claims=extract_claims(answer))
     pending: list[Claim] = []
@@ -216,7 +260,7 @@ def evaluate(answer: str, sources: list[dict] | None) -> Result:
         pending.append(c)
     if pending:
         try:
-            _judge(pending, sources)
+            _judge(pending, sources, chart)
         except Exception as e:  # noqa: BLE001 — judge 壞掉：結果標成不可信，不猜
             logger.warning("faithfulness judge 失敗：%s", e)
             result.error = str(e)
@@ -231,7 +275,8 @@ def _comment(res: Result) -> str | None:
                     for c in bad[:5])
 
 
-def maybe_score_async(answer: str, sources: list[dict] | None) -> None:
+def maybe_score_async(answer: str, sources: list[dict] | None,
+                      chart: dict | None = None) -> None:
     """線上抽樣：命中抽樣率就在背景評分，回寫到目前這個 trace。不命中／沒來源就什麼都不做。
 
     必須在 trace 還有效的地方呼叫（ask / ws_ask 裡），先把 trace_id 取出來再進背景執行緒——
@@ -247,7 +292,7 @@ def maybe_score_async(answer: str, sources: list[dict] | None) -> None:
 
     def work() -> None:
         try:
-            res = evaluate(answer, sources)
+            res = evaluate(answer, sources, chart)
             if res.error or res.score is None:
                 return
             tracing.score_trace(trace_id, "faithfulness", res.score, comment=_comment(res))

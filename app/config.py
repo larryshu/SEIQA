@@ -78,8 +78,10 @@ class Settings:
     # ---- 忠實度量測（faithfulness.py：被引用的原文是否支持論點）----
     # 線上抽樣率：0＝關閉。每抽中一題多一次 LLM 呼叫（背景執行，不影響回應時間），開多少由人決定。
     faith_sample_rate: float = _float("FAITH_SAMPLE_RATE", 0.0)
-    # 交給 judge 的每則原文截斷長度：貼文動輒數千字，全塞進去又貴又稀釋注意力。
+    # 交給 judge 的原文長度：總預算平均分給被引用的那幾則（單則上限 8000），但每則至少 FAITH_SOURCE_CHARS。
+    # 引用少就讀長一點（避免論點在後段被誤判 not_found），引用多就維持短版（避免 prompt 暴增）。
     faith_source_chars: int = _int("FAITH_SOURCE_CHARS", 1500)
+    faith_source_budget: int = _int("FAITH_SOURCE_BUDGET", 30000)
     # NLI 初篩（選配，需另裝 transformers + torch）：留空＝不用，全交 LLM。
     # 建議 MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7（多語、含中文）。
     faith_nli_model: str = os.environ.get("FAITH_NLI_MODEL", "").strip()
