@@ -38,7 +38,13 @@ BOARDS: dict[str, str] = {
     "MobileComm": "手機、通訊、行動裝置",
     "iOS": "iPhone、Apple、iOS",
     "Tech_Job": "科技業、工程師、工作、職場",
-    "AI_Art": "AI、生成式 AI、AI 繪圖、ChatGPT／LLM／大型語言模型討論",
+    # Soft_Job 原本不在清單：問「ChatGPT 和 Claude 哪個好用」時只能選 AI_Art，撈回來多是新聞與
+    # 單一功能閒聊（reranker 75 則只留 13 則）；實際搜過，最貼題的使用比較文在 Soft_Job
+    # （「claude和codex之使用區分」「大家覺得ChatGPT-5表現如何」）。
+    "Soft_Job": "軟體工程師、寫程式、AI 寫程式工具（Claude Code、Codex、Copilot）、"
+                "ChatGPT／Claude／Gemini 等 LLM 的實際使用心得與『哪個好用』的比較"
+                "（問 LLM 好不好用、怎麼選時，與 AI_Art 兩個板都要搜）",
+    "AI_Art": "AI 繪圖、生成式 AI 新聞與閒聊（ChatGPT、Claude 等 LLM 的新功能、訂閱方案、動態）",
     "PC_Shopping": "電腦硬體、DIY、顯示卡、組裝、3C 開箱",
     "Boy-Girl": "感情、男女、交往、分手",
     "marriage": "婚姻、夫妻、家庭",
