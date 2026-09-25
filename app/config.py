@@ -87,18 +87,23 @@ class Settings:
     rerank_min_score: float = _float("RERANK_MIN_SCORE", 2.0)       # 0～3 分，低於此分不補位
     rerank_per_platform_min: int = _int("RERANK_PER_PLATFORM_MIN", 3)  # 每個平台至少保留幾則（>0 分）
 
-    # ---- 忠實度放行關卡（agent._faithfulness_gate；只用在非串流的 /ask）----
+    # ---- 忠實度放行關卡（agent._faithfulness_gate）----
     # 答案送出前先讓 judge 核對引用，不符的句子請模型修正、仍不過就刪句。
-    # 每題多一次 judge 呼叫（約 5～10 秒），所以預設關，A/B 確認後再開。
+    # 預設開（2026-09-25 決定）：9 題 dataset 每題只多約 4 秒（+1.8%），相對爬蟲的 200 秒可忽略。
+    # 開著時每一題有來源的答案都會記 faithfulness 分數，等於全量監控，FAITH_SAMPLE_RATE 抽樣就不再跑。
     faith_gate_enabled: bool = os.environ.get(
-        "FAITH_GATE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+        "FAITH_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
     # 串流版（/ws/ask，/demo 前端用的就是這條）也套用：查到來源後的答案先扣住，跑完稽核重寫
-    # 與上面的關卡才分段送出。第一個字會晚約十秒出現，所以與 FAITH_GATE_ENABLED 分開控制。
+    # 與上面的關卡才分段送出。實測第一個字約晚 11 秒出現（總完成時間只多幾秒），
+    # 是體驗上的取捨，所以與 FAITH_GATE_ENABLED 分開控制；預設開，覺得等太久就設 false。
     faith_gate_stream: bool = os.environ.get(
-        "FAITH_GATE_STREAM", "false").strip().lower() in ("1", "true", "yes", "on")
-    # 要處理哪些判定：contradicted＝跟原文相反（最嚴重）；加上 not_found＝原文沒提到也處理。
+        "FAITH_GATE_STREAM", "true").strip().lower() in ("1", "true", "yes", "on")
+    # 要處理哪些判定：contradicted＝跟原文相反（最嚴重）；not_found＝原文沒提到（憑空多出來的說法）。
+    # 兩者都處理：not_found 一樣是把沒有的事說成網友講的。先前 not_found 的誤判來源
+    # （占比題的比例、長文截斷、右引號切句）都已修掉；若之後發現誤刪，改回只留 contradicted。
     faith_gate_verdicts: tuple[str, ...] = tuple(
-        v.strip() for v in os.environ.get("FAITH_GATE_VERDICTS", "contradicted").split(",")
+        v.strip() for v in os.environ.get(
+            "FAITH_GATE_VERDICTS", "contradicted,not_found").split(",")
         if v.strip())
 
     # ---- 忠實度量測（faithfulness.py：被引用的原文是否支持論點）----

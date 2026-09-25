@@ -509,12 +509,12 @@ RERANK_PER_PLATFORM_MIN=3            # 每個平台至少保留幾則（>0 分�
 AUDIT_RETRY_ENABLED=true             # 違規才多一次 LLM 呼叫；仍違規就機械式清掉假引用與字元圖表
 
 # --- 忠實度放行關卡（送出前核對引用；見 agent._faithfulness_gate）---
-FAITH_GATE_ENABLED=false             # 每題多一次 judge 呼叫（約 5～10 秒）；不符的句子先請模型修正，仍不過就刪句
-FAITH_GATE_VERDICTS=contradicted     # 處理哪些判定；加上 not_found 則「原文沒提到」的句子也處理
-FAITH_GATE_STREAM=false              # 串流版 /ws/ask 也套用：查到來源後先扣住答案、核對完才分段送出（第一個字約晚 10 秒）
+FAITH_GATE_ENABLED=true              # 每題多一次 judge 呼叫（實測約 +4 秒）；不符的句子先請模型修正，仍不過就刪句
+FAITH_GATE_VERDICTS=contradicted,not_found  # 跟原文相反、原文沒提到都處理；誤刪太多就只留 contradicted
+FAITH_GATE_STREAM=true               # 串流版 /ws/ask 也套用：查到來源後先扣住答案、核對完才分段送出（第一個字約晚 11 秒）
 
 # --- 忠實度量測（被引用的原文是否支持論點；見 app/faithfulness.py）---
-FAITH_SAMPLE_RATE=0                  # 線上抽樣率，0＝關閉；例 0.1＝抽一成題目在背景評分（多一次 LLM 呼叫）
+FAITH_SAMPLE_RATE=0                  # 線上抽樣率，0＝關閉；關卡開著時不跑（關卡已逐題記分），關卡關掉時才由它監控
 FAITH_SOURCE_CHARS=1500              # 每則原文交給 judge 的最短長度
 FAITH_SOURCE_BUDGET=30000            # 原文總預算，平均分給被引用的幾則（單則上限 8000）
 FAITH_NLI_MODEL=                     # 選配 NLI 初篩（需另裝 transformers torch）；留空＝全交 LLM
