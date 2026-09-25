@@ -87,6 +87,20 @@ class Settings:
     rerank_min_score: float = _float("RERANK_MIN_SCORE", 2.0)       # 0～3 分，低於此分不補位
     rerank_per_platform_min: int = _int("RERANK_PER_PLATFORM_MIN", 3)  # 每個平台至少保留幾則（>0 分）
 
+    # ---- 忠實度放行關卡（agent._faithfulness_gate；只用在非串流的 /ask）----
+    # 答案送出前先讓 judge 核對引用，不符的句子請模型修正、仍不過就刪句。
+    # 每題多一次 judge 呼叫（約 5～10 秒），所以預設關，A/B 確認後再開。
+    faith_gate_enabled: bool = os.environ.get(
+        "FAITH_GATE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    # 串流版（/ws/ask，/demo 前端用的就是這條）也套用：查到來源後的答案先扣住，跑完稽核重寫
+    # 與上面的關卡才分段送出。第一個字會晚約十秒出現，所以與 FAITH_GATE_ENABLED 分開控制。
+    faith_gate_stream: bool = os.environ.get(
+        "FAITH_GATE_STREAM", "false").strip().lower() in ("1", "true", "yes", "on")
+    # 要處理哪些判定：contradicted＝跟原文相反（最嚴重）；加上 not_found＝原文沒提到也處理。
+    faith_gate_verdicts: tuple[str, ...] = tuple(
+        v.strip() for v in os.environ.get("FAITH_GATE_VERDICTS", "contradicted").split(",")
+        if v.strip())
+
     # ---- 忠實度量測（faithfulness.py：被引用的原文是否支持論點）----
     # 線上抽樣率：0＝關閉。每抽中一題多一次 LLM 呼叫（背景執行，不影響回應時間），開多少由人決定。
     faith_sample_rate: float = _float("FAITH_SAMPLE_RATE", 0.0)

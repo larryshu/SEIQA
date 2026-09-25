@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from . import audit, llm, progress, tracing, user_memory
+from . import audit, faithfulness, llm, progress, tracing, user_memory
 from .config import settings
 from .config_repo import repo
 from .llm import chat_with_tools
@@ -311,6 +311,66 @@ def _audit_retry(ctx: "_RunContext", messages: list[dict], answer: str,
     return chosen
 
 
+def _faithfulness_gate(ctx: "_RunContext", messages: list[dict], answer: str,
+                       sources: list[dict], chart: dict | None) -> str:
+    """答案送出前的語意關卡：judge 判定跟原文不符的論點，請模型修正；仍不過就刪句。
+
+    audit.py 只擋得住格式錯（假引用、超範圍編號）；「引用編號正確、內容卻曲解原文」
+    要讀原文才判斷得出來，這一關就是把 faithfulness 的 judge 從「事後打分」搬到「送出前」。
+
+    處理哪些判定由 FAITH_GATE_VERDICTS 決定（預設只處理 contradicted）。流程：
+      1) judge 核對原答案 → 沒有要處理的論點就原樣放行；
+      2) 帶著「哪幾句、原文實際怎麼說」請模型只改那幾句，重新核對，問題變少才採用；
+      3) 還有剩 → faithfulness.remove_claims 刪掉那幾句（寧可少講，不要講錯）。
+    judge 失敗一律放行原答案（fail-safe）。只用在非串流 run()，理由同 _audit_retry。
+    """
+    if not settings.faith_gate_enabled or not sources:
+        return answer
+    handled = set(settings.faith_gate_verdicts)
+    first = faithfulness.evaluate(answer, sources, chart)
+    if first.error or not first.claims:
+        return answer
+    # 原答案的忠實度照記：關卡會把錯誤修掉，不記這一筆就看不出模型本身的錯誤率
+    tracing.score("faithfulness", first.score, comment=faithfulness._comment(first))  # noqa: SLF001
+    bad = [c for c in first.claims if c.verdict in handled]
+    if not bad:
+        return answer
+
+    chosen, left = answer, bad
+    try:
+        lines = "\n".join(
+            f"- 「{c.text}」（引用 {'、'.join(f'[{n}]' for n in c.cites)}）："
+            + ("原文的意思跟這句相反" if c.verdict == faithfulness.CONTRADICTED else "原文沒有提到這件事")
+            + (f"。原文實際寫的是：「{c.evidence}」" if c.evidence else "")
+            for c in bad)
+        fix = ("你剛才的回答裡，下面這幾句跟所引用的原文對不上：\n" + lines + "\n"
+               "請重新輸出『完整的回答』：這幾句改成原文實際的意思，改不了就整句刪掉；"
+               "其他部分維持原樣，不要解釋你改了什麼。")
+        msg = chat_with_tools(
+            messages + [{"role": "assistant", "content": answer},
+                        {"role": "system", "content": fix}],
+            ctx.tools, temperature=ctx.temperature, model=ctx.model, tool_choice="none")
+        retried = msg.content or ""
+        if retried:
+            second = faithfulness.evaluate(retried, sources, chart)
+            retry_bad = [c for c in second.claims if c.verdict in handled]
+            if not second.error and len(retry_bad) < len(bad):
+                chosen, left = retried, retry_bad
+    except Exception as e:  # noqa: BLE001 — 重寫失敗就沿用原答案，再走刪句
+        logger.warning("忠實度關卡重寫失敗（改走刪句）：%s", e)
+
+    if left:
+        trimmed = faithfulness.remove_claims(chosen, left)
+        # 刪到幾乎不剩就不硬給：誠實說沒有能支持的內容，比給一段殘缺的回答好
+        chosen = trimmed if len(trimmed) >= 20 else (
+            "這次撈到的社群討論裡，找不到能明確支持這個問題的內容，建議換個問法再試一次。")
+    chosen = audit.repair(chosen, len(sources))  # 重寫可能帶進格式問題，順手清掉
+    tracing.score("faithfulness_gate", 0.0 if left else 1.0,
+                  comment=f"原有 {len(bad)} 句不符"
+                          + (f"；重寫後仍有 {len(left)} 句，已刪除" if left else "；已全部修正"))
+    return chosen
+
+
 @observe(name="agent_loop", capture_input=False, capture_output=False)
 def run(user_message: str, history: list[dict] | None = None, session_id: str = "default",
         end_user_id: int | None = None) -> dict:
@@ -330,6 +390,8 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
         msg = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model)
         if not msg.tool_calls:
             answer = _audit_retry(ctx, messages, msg.content or "", sources, used_tools)
+            answer = _faithfulness_gate(ctx, messages, answer, sources,
+                                        charts[-1] if charts else None)
             messages.append({"role": "assistant", "content": answer})
             _finish_span(user_message, answer, used_tools, sources)
             return {"answer": answer, "used_tools": used_tools, "sources": sources,
@@ -354,6 +416,7 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
                             tool_choice="none")
     answer = final.content or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
     answer = _audit_retry(ctx, messages, answer, sources, used_tools)
+    answer = _faithfulness_gate(ctx, messages, answer, sources, charts[-1] if charts else None)
     messages.append({"role": "assistant", "content": answer})
     _finish_span(user_message, answer, used_tools, sources)
     return {"answer": answer, "used_tools": used_tools, "sources": sources,
@@ -362,19 +425,46 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
 
 
 def _stream_once(ctx: _RunContext, messages: list[dict],
-                 tool_choice: str = "auto") -> tuple[dict, bool]:
-    """跑一次串流補全：token 邊收邊 emit。回 (assistant message dict, 是否吐過 token)。"""
+                 tool_choice: str = "auto", emit_tokens: bool = True) -> tuple[dict, bool]:
+    """跑一次串流補全：token 邊收邊 emit。回 (assistant message dict, 是否吐過 token)。
+
+    emit_tokens=False：照樣串流（取消檢查照常），但先不送到畫面——答案要先過稽核與
+    忠實度關卡才能給使用者看（見 _verify_then_emit）。
+    """
     streamed = False
     msg: dict = {}
     for kind, payload in llm.chat_with_tools_stream(
             messages, ctx.tools, temperature=ctx.temperature, model=ctx.model,
             tool_choice=tool_choice):
         if kind == "token":
-            streamed = True
-            progress.emit("token", text=payload)
+            if emit_tokens:
+                streamed = True
+                progress.emit("token", text=payload)
         else:
             msg = payload  # type: ignore[assignment]
     return msg, streamed
+
+
+_EMIT_CHUNK = 20  # 核對完的答案分段送出，每段幾個字：前端照樣看到逐步長出來，前端程式不必改
+
+
+def _verify_then_emit(ctx: _RunContext, messages: list[dict], answer: str,
+                      sources: list[dict], used_tools: list[str], charts: list[dict]) -> str:
+    """串流版的「先核對、再送出」：答案收齊後跑稽核重寫與忠實度關卡，通過的才分段送出。
+
+    串流版原本做不了這兩關——答案在稽核之前就一個字一個字上了使用者的畫面，事後改寫
+    等於當面換掉整段字。改成先收齊、核對完再送，代價是第一個字要晚十秒左右才出現，
+    所以用 FAITH_GATE_STREAM 另外控制，並推一則 stage 告訴使用者在等什麼。
+    """
+    progress.emit("stage", stage="verifying", text="正在核對答案與引用的原文…")
+    progress.raise_if_cancelled()
+    answer = _audit_retry(ctx, messages, answer, sources, used_tools)
+    progress.raise_if_cancelled()
+    answer = _faithfulness_gate(ctx, messages, answer, sources, charts[-1] if charts else None)
+    progress.raise_if_cancelled()
+    for i in range(0, len(answer), _EMIT_CHUNK):
+        progress.emit("token", text=answer[i:i + _EMIT_CHUNK])
+    return answer
 
 
 @observe(name="agent_loop_streaming", capture_input=False, capture_output=False)
@@ -394,11 +484,16 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
 
     for _ in range(ctx.max_rounds):
         progress.raise_if_cancelled()
-        msg, streamed = _stream_once(ctx, messages)
+        # 已經查到來源的回合，這次吐出來的可能就是要引用來源的答案 → 先扣住、核對完再送。
+        # 還沒查到來源（第一回合、常識題）照舊即時串流：沒有來源就沒有引用可核對。
+        hold = settings.faith_gate_stream and bool(sources)
+        msg, streamed = _stream_once(ctx, messages, emit_tokens=not hold)
 
         if not msg.get("tool_calls"):  # 不需查（🟡 常識題）→ 剛剛串出去的就是答案
             answer = msg.get("content") or ""
-            if not streamed:  # 模型沒串出東西（極少見）→ 補送一次，前端才有內容
+            if hold:
+                answer = _verify_then_emit(ctx, messages, answer, sources, used_tools, charts)
+            elif not streamed:  # 模型沒串出東西（極少見）→ 補送一次，前端才有內容
                 progress.emit("token", text=answer)
             messages.append({"role": "assistant", "content": answer})
             _finish_span(user_message, answer, used_tools, sources)
@@ -425,9 +520,13 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
 
     progress.raise_if_cancelled()
     progress.emit("stage", stage="answering", text="讀完討論了，開始生成回答…")
-    final, streamed = _stream_once(ctx, messages, tool_choice="none")  # 收尾：不准再叫工具
+    hold = settings.faith_gate_stream and bool(sources)
+    final, streamed = _stream_once(ctx, messages, tool_choice="none",  # 收尾：不准再叫工具
+                                   emit_tokens=not hold)
     answer = final.get("content") or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
-    if not streamed:
+    if hold:
+        answer = _verify_then_emit(ctx, messages, answer, sources, used_tools, charts)
+    elif not streamed:
         progress.emit("token", text=answer)
     messages.append({"role": "assistant", "content": answer})
     _finish_span(user_message, answer, used_tools, sources)

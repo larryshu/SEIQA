@@ -122,6 +122,17 @@ def dispatch(name: str, arguments: str, session_id: str,
     return f"[tool error] 未知工具：{name}"
 
 
+# 「標了編號就要對得回原文」：與 [n] 格式規則分開，因為錯的方式不同——格式錯是點不到來源，
+# 這裡防的是點得到、但那則根本沒這樣說（faithfulness 量測抓到的就是這種）。
+# 放在工具回傳的尾端而不是 system prompt：線上的 prompt 由後台管理（M3），改程式裡的
+# SYSTEM_PROMPT 不會生效；而且緊鄰生成點的指示最不容易被上萬字的貼文稀釋（同 cite_rule）。
+_CITE_FAITHFUL = (
+    "【引用要忠於原文】標了 [編號] 的句子，意思必須能在那一則裡直接找到——對方真的這樣說過。"
+    "你自己的歸納、推測、總結不要標編號。一句話綜合了好幾則時，只標真的講到這件事的那幾則。"
+    "拿不準某則有沒有這樣說，就不要標它，也不要把它寫成網友的說法。"
+)
+
+
 def _community_search(query: str, session_id: str, sources: list | None = None,
                       end_user_id: int | None = None) -> str:
     """並行查所有啟用的社群平台，合併各邊討論。沒命中→請 LLM 退回常識。
@@ -170,7 +181,8 @@ def _community_search(query: str, session_id: str, sources: list | None = None,
         "例如引用第 3 則就寫 [3]、引用第 17 則就寫 [17]。\n"
         "**「n」只是代號，不是要你輸出的字。絕對不可以在答案裡出現「[n]」這三個字元**——"
         f"那樣讀者點不到來源，等同假引用。每個中括號裡都必須是 1～{len(posts)} 之間的實際數字。\n"
-        "不用每句都標，也不要讓來源變成回答的主角；沒有對應貼文的句子就不要標。"
+        "不用每句都標，也不要讓來源變成回答的主角；沒有對應貼文的句子就不要標。\n"
+        + _CITE_FAITHFUL
     )
     return (
         note + "\n\n以下為各社群平台撈到的相關討論（開頭括號標了編號與來源平台）。請『綜合』"
@@ -246,7 +258,10 @@ def _stance_breakdown(issue: str, session_id: str, sources: list | None, charts:
         "圖表已經由前端畫出來、顯示在使用者畫面上了。\n"
         "請用『文字』說明這個分佈代表什麼、兩邊各在意什麼"
         "（可引用貼文編號，寫成 [3] [17] 這種實際數字，不要寫成 [n]）。"
-        "不要重畫圖、不要用文字符號拼圖表，也不要改動上面的數字。"
+        "不要重畫圖、不要用文字符號拼圖表，也不要改動上面的數字。\n"
+        + _CITE_FAITHFUL
+        + "講某一派的比例或整體分佈時，不要把一整串編號掛在同一句後面；"
+        "只挑一兩則最能代表那一派說法的貼文來標。"
         + (_reused_post_list(data, posts) if reused else "")
     )
 

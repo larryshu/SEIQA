@@ -46,7 +46,10 @@ _CITE = re.compile(r"\[(\d{1,3}(?:\s*[,，、]\s*\d{1,3})*)\]")
 # 模型常把引用放在句號「之後」（「……很慢。[2]」），切句前先把它搬回句號前面，
 # 否則 [2] 會被切到下一句的開頭、掛錯論點。
 _CITE_AFTER_STOP = re.compile(r"([。！？!?])((?:\s*\[\d{1,3}(?:\s*[,，、]\s*\d{1,3})*\])+)")
-_SENT_END = re.compile(r"(?<=[。！？!?\n])")
+# 句號後面若緊接右引號／右括號（「……。」），要等它們一起收進這一句才切，
+# 否則右引號會被切到下一句開頭，論點變成「」這些都很重要」這種樣子。
+_SENT_END = re.compile(r"(?<=[。！？!?\n])(?![」』）)〕】\"'])"
+                       r"|(?<=[。！？!?][」』）)〕】\"'])")
 _BULLET = re.compile(r"^\s*(?:[-*•·]\s+|\d+[.、)）]\s*|#+\s*)")
 _MIN_CLAIM_CHARS = 4
 
@@ -104,6 +107,32 @@ def extract_claims(answer: str) -> list[Claim]:
             if len(claim) >= _MIN_CLAIM_CHARS:
                 out.append(Claim(text=claim, cites=cites))
     return out
+
+
+def remove_claims(answer: str, bad: list[Claim]) -> str:
+    """把 bad 裡的論點所在的『整句』刪掉（放行關卡重寫之後仍不過時的最後一道）。
+
+    刪整句而不是只刪那一段：句內其他片段通常靠這個論點才讀得通，只挖掉一半會變成病句。
+    代價是同句裡沒問題的片段也一起消失——寧可少講，不要講錯。
+    """
+    if not bad:
+        return answer
+    text = _CITE_AFTER_STOP.sub(r"\2\1", answer or "")
+    kept = []
+    drop_newline = False
+    for sent in _SENT_END.split(text):
+        # 切句是在「。」與「\n」之後各切一刀，所以一行「- 某句。\n」會變成兩段：
+        # 句子本身、以及後面單獨一個換行。刪了句子就要連那個換行一起刪，否則會多出空行。
+        if drop_newline and not sent.strip():
+            drop_newline = False
+            continue
+        drop_newline = False
+        plain = _BULLET.sub("", _CITE.sub("", sent)).replace("**", "")
+        if any(c.text and c.text in plain for c in bad):
+            drop_newline = not sent.endswith("\n")
+            continue
+        kept.append(sent)
+    return re.sub(r"\n{3,}", "\n\n", "".join(kept)).strip()
 
 
 def _source_text(src: dict, limit: int | None = None) -> str:

@@ -32,6 +32,23 @@ EXTRACT_CASES: list[tuple[str, str, list[tuple[str, list[int]]]]] = [
     ("條列與粗體", "- **價格**偏高 [1]\n- 售後服務不錯 [2]",
      [("價格偏高", [1]), ("售後服務不錯", [2])]),
     ("常識題沒有引用", "攝氏 100 度等於華氏 212 度。", []),
+    ("句號後的右引號歸前一句", "有人說「安靜最重要。」價格也很重要 [2]。",
+     [("價格也很重要", [2])]),
+]
+
+# ---------- 1b) 刪句（放行關卡的最後一道）：(說明, 答案, 要刪的論點關鍵字, 預期結果) ----------
+_LIST = ("**整體來看**，大家對遠端工作評價兩極。\n"
+         "- 有人覺得生活品質變好 [1]，也有人說很孤單 [2]。\n"
+         "- 多數人認為薪水比較高 [3]。\n"
+         "所以還是看個人。")
+REMOVE_CASES: list[tuple[str, str, str, str]] = [
+    ("刪條列項目、不留空行", _LIST, "薪水",
+     "**整體來看**，大家對遠端工作評價兩極。\n- 有人覺得生活品質變好 [1]，也有人說很孤單 [2]。\n所以還是看個人。"),
+    ("同句另一段有問題就刪整句", _LIST, "孤單",
+     "**整體來看**，大家對遠端工作評價兩極。\n- 多數人認為薪水比較高 [3]。\n所以還是看個人。"),
+    ("段落之間的句子", "第一段很好 [1]。\n\n第二段有問題 [2]。\n\n第三段 [3]。", "第二段",
+     "第一段很好 [1]。\n\n第三段 [3]。"),
+    ("沒有要刪的就原樣", "很好 [1]。", "不存在", "很好 [1]。"),
 ]
 
 # ---------- 2) judge 校準：(說明, 論點, 原文, 正解) ----------
@@ -75,6 +92,19 @@ def check_extract() -> int:
     return fails
 
 
+def check_remove() -> int:
+    fails = 0
+    for label, answer, kw, expected in REMOVE_CASES:
+        bad = [c for c in fa.extract_claims(answer) if kw in c.text]
+        got = fa.remove_claims(answer, bad)
+        ok = got == expected
+        print(f"{'OK  ' if ok else 'FAIL'} 刪句｜{label}")
+        if not ok:
+            fails += 1
+            print(f"       預期 {expected!r}\n       實得 {got!r}")
+    return fails
+
+
 def check_judge() -> int:
     """每題單獨一個 source，走 evaluate() 真實路徑（含 NLI 初篩，若有啟用）。"""
     wrong = 0
@@ -98,6 +128,9 @@ def check_judge() -> int:
 def main() -> int:
     fails = check_extract()
     print(f"\n拆論點：{len(EXTRACT_CASES) - fails}/{len(EXTRACT_CASES)} 通過\n")
+    removed = check_remove()
+    print(f"\n刪句：{len(REMOVE_CASES) - removed}/{len(REMOVE_CASES)} 通過\n")
+    fails += removed
     if "--judge" in sys.argv:
         fails += check_judge()
         from app import tracing
