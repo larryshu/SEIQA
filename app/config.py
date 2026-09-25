@@ -113,7 +113,11 @@ class Settings:
     # 串流版寫答案那一刀可直接串流，第一個字反而比只開關卡早（查完資料後約 10 秒 vs 12 秒）。
     evidence_mode: bool = os.environ.get(
         "EVIDENCE_MODE", "true").strip().lower() in ("1", "true", "yes", "on")
-    evidence_max_claims: int = _int("EVIDENCE_MAX_CLAIMS", 12)      # 最多抽幾條論點
+    # 最多抽幾條論點：12 條時答案只引用到約 9 則來源，20 條能涵蓋更多平台與立場
+    evidence_max_claims: int = _int("EVIDENCE_MAX_CLAIMS", 20)
+    # 寫答案的長度目標（字）：0＝不指定，模型會自然收在 600～700 字；使用者偏好的回答長度優先。
+    # 模型實際會寫得比目標長：實測目標 900 → 約 1,400 字、目標 1,200 → 約 1,600 字（皆為原本 2 倍以上）。
+    evidence_answer_chars: int = _int("EVIDENCE_ANSWER_CHARS", 1200)
     evidence_fuzzy_min: float = _float("EVIDENCE_FUZZY_MIN", 0.9)   # 引句模糊比對門檻（0～1）
 
     # ---- 忠實度量測（faithfulness.py：被引用的原文是否支持論點）----

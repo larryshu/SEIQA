@@ -515,7 +515,8 @@ FAITH_GATE_STREAM=true               # 串流版 /ws/ask 也套用：查到來�
 
 # --- 先抽證據、再比對引句、最後才寫答案（見 app/evidence.py）---
 EVIDENCE_MODE=true                   # 答案只能從「已逐字核對過原文的論點」取材；A/B：faithfulness 持平、每題 +11 秒
-EVIDENCE_MAX_CLAIMS=12               # 最多抽幾條論點
+EVIDENCE_MAX_CLAIMS=20               # 最多抽幾條論點（越多，答案涵蓋的來源越廣）
+EVIDENCE_ANSWER_CHARS=900            # 答案長度目標；模型實際約寫 1.5 倍（900 → 約 1,400 字），0＝不指定
 EVIDENCE_FUZZY_MIN=0.9               # 引句模糊比對門檻（容忍模型順手修掉的錯字、標點）
 
 # --- 忠實度量測（被引用的原文是否支持論點；見 app/faithfulness.py）---

@@ -154,6 +154,14 @@ def write_messages(messages: list[dict], verified: list[Evidence], sources: list
         percent = "、".join(f"{k} {v}%" for k, v in chart["percent"].items())
         stats = (f"\n\n另有程式統計的立場分佈（共 {chart.get('total', '?')} 則）：{percent}。"
                  "圖表已由前端畫出，比例可以直接引用，不要改動數字、不要用文字拼圖表。")
+    # 長度目標：不給的話模型照「朋友聊天」的口吻自然收在 600～700 字——實測把論點從 12 條
+    # 加到 24 條，答案也只長 12%。所以要明講「每條都寫到、展開到多長」。使用者偏好有指定
+    # 回答長度時以偏好為準（偏好已貼在 system prompt 裡）。
+    length = ""
+    if settings.evidence_answer_chars > 0:
+        length = (f"- 盡量把清單裡的論點都寫進去，依平台或立場分段展開，每一派說清楚他們在意什麼、"
+                  f"舉了什麼例子；全文大約 {settings.evidence_answer_chars} 字。"
+                  "若上面的使用者偏好有指定回答長度，以偏好為準。\n")
     rules = (
         "以下是從社群討論中擷取、並已由程式逐字核對過原文的論點（中括號是來源編號）：\n\n"
         + "\n".join(lines) + stats + "\n\n"
@@ -161,6 +169,7 @@ def write_messages(messages: list[dict], verified: list[Evidence], sources: list
         "- 說到某個論點時，在句尾標上它的來源編號，例如 [3]；編號只能用上面出現過的。\n"
         "- 不可以加入清單以外的「網友說／有人認為」——清單沒有的說法就是這次沒有依據。\n"
         "- 可以用自己的話串接、歸納，但歸納的句子不要標編號，也不要把歸納講成網友的原話。\n"
+        + length +
         "- 論點彼此矛盾時如實呈現兩邊。"
     )
     return base + [{"role": "system", "content": rules}]
