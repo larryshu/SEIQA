@@ -323,7 +323,13 @@ def _run_blocking_inner(question: str, history: list[dict], session_id: str,
     user_memory.remember(end_user_id, question, result["answer"], session_id=session_id)
     # 與 /ask 同一套稽核（見該處註解）。放在 emit done 之前也無妨——純字串比對，微秒等級。
     audit.audit_and_score(result["answer"], sources, result.get("used_tools"))
-    if not (settings.faith_gate_enabled and settings.faith_gate_stream):  # 理由同 /ask
+    # 關卡在串流版跑過時已經逐題記了 faithfulness，這裡就不再抽（理由同 /ask）。
+    # 但證據模式開著時，串流版會跳過關卡（素材已逐字核對過），若這裡也不抽，
+    # /demo 的答案就完全沒有 faithfulness 監控——所以證據模式下照樣依 FAITH_SAMPLE_RATE 抽樣。
+    # （證據流程退回、改走關卡的少數題目會被記兩筆，可接受。）
+    gate_scored = (settings.faith_gate_enabled and settings.faith_gate_stream
+                   and not settings.evidence_mode)
+    if not gate_scored:
         faithfulness.maybe_score_async(result["answer"], sources,  # 抽樣、背景執行
                                        result.get("chart"))
     # 追問建議：依這一輪問答產生幾個 follow-up（fail-safe，產不出來就回 []）。

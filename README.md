@@ -519,7 +519,7 @@ EVIDENCE_MAX_CLAIMS=12               # 最多抽幾條論點
 EVIDENCE_FUZZY_MIN=0.9               # 引句模糊比對門檻（容忍模型順手修掉的錯字、標點）
 
 # --- 忠實度量測（被引用的原文是否支持論點；見 app/faithfulness.py）---
-FAITH_SAMPLE_RATE=0                  # 線上抽樣率，0＝關閉；關卡開著時不跑（關卡已逐題記分），關卡關掉時才由它監控
+FAITH_SAMPLE_RATE=0                  # 線上抽樣率，0＝關閉；串流版在證據模式下跳過關卡，/demo 的 faithfulness 靠它抽樣
 FAITH_SOURCE_CHARS=1500              # 每則原文交給 judge 的最短長度
 FAITH_SOURCE_BUDGET=30000            # 原文總預算，平均分給被引用的幾則（單則上限 8000）
 FAITH_NLI_MODEL=                     # 選配 NLI 初篩（需另裝 transformers torch）；留空＝全交 LLM
