@@ -513,6 +513,11 @@ FAITH_GATE_ENABLED=true              # 每題多一次 judge 呼叫（實測約 
 FAITH_GATE_VERDICTS=contradicted,not_found  # 跟原文相反、原文沒提到都處理；誤刪太多就只留 contradicted
 FAITH_GATE_STREAM=true               # 串流版 /ws/ask 也套用：查到來源後先扣住答案、核對完才分段送出（第一個字約晚 11 秒）
 
+# --- 先抽證據、再比對引句、最後才寫答案（見 app/evidence.py）---
+EVIDENCE_MODE=true                   # 答案只能從「已逐字核對過原文的論點」取材；A/B：faithfulness 持平、每題 +11 秒
+EVIDENCE_MAX_CLAIMS=12               # 最多抽幾條論點
+EVIDENCE_FUZZY_MIN=0.9               # 引句模糊比對門檻（容忍模型順手修掉的錯字、標點）
+
 # --- 忠實度量測（被引用的原文是否支持論點；見 app/faithfulness.py）---
 FAITH_SAMPLE_RATE=0                  # 線上抽樣率，0＝關閉；關卡開著時不跑（關卡已逐題記分），關卡關掉時才由它監控
 FAITH_SOURCE_CHARS=1500              # 每則原文交給 judge 的最短長度

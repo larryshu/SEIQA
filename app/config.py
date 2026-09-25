@@ -106,6 +106,16 @@ class Settings:
             "FAITH_GATE_VERDICTS", "contradicted,not_found").split(",")
         if v.strip())
 
+    # ---- 先抽證據、再比對引句、最後才寫答案（evidence.py；agent._evidence_messages）----
+    # 補關卡的缺口：關卡只查有標 [n] 的句子，這裡讓答案只能從「已逐字核對過原文的論點」取材。
+    # 預設開（2026-09-25，9 題 dataset A/B，對照只開關卡）：faithfulness 100% → 100%、
+    # 每題 +11 秒（+5%）、論點數 −12%、引句通過率約 92%（省略號切段後更高）。
+    # 串流版寫答案那一刀可直接串流，第一個字反而比只開關卡早（查完資料後約 10 秒 vs 12 秒）。
+    evidence_mode: bool = os.environ.get(
+        "EVIDENCE_MODE", "true").strip().lower() in ("1", "true", "yes", "on")
+    evidence_max_claims: int = _int("EVIDENCE_MAX_CLAIMS", 12)      # 最多抽幾條論點
+    evidence_fuzzy_min: float = _float("EVIDENCE_FUZZY_MIN", 0.9)   # 引句模糊比對門檻（0～1）
+
     # ---- 忠實度量測（faithfulness.py：被引用的原文是否支持論點）----
     # 線上抽樣率：0＝關閉。每抽中一題多一次 LLM 呼叫（背景執行，不影響回應時間），開多少由人決定。
     faith_sample_rate: float = _float("FAITH_SAMPLE_RATE", 0.0)

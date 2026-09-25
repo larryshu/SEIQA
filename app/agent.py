@@ -14,14 +14,17 @@ fail-safe：工具炸掉/沒結果，crawler 與 tools 已各自吞例外，最�
 """
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple
 
-from . import audit, faithfulness, llm, progress, tracing, user_memory
+from . import audit, evidence, faithfulness, llm, progress, tracing, user_memory
 from .config import settings
 from .config_repo import repo
 from .llm import chat_with_tools
 from .tools import TOOLS, dispatch
 from .tracing import observe
+
+logger = logging.getLogger(__name__)
 
 # 刻意不寫死平台名稱：啟用哪些平台由後台與使用者偏好決定，而 community_search 的回傳
 # 開頭就會列出「本次有撈到資料的平台／沒撈到的平台」。prompt 裡再列一次清單，只會在加減
@@ -371,6 +374,32 @@ def _faithfulness_gate(ctx: "_RunContext", messages: list[dict], answer: str,
     return chosen
 
 
+def _evidence_messages(ctx: "_RunContext", messages: list[dict], sources: list[dict],
+                       charts: list[dict]) -> list[dict] | None:
+    """EVIDENCE_MODE：抽論點＋逐字引句 → 程式核對 → 回「只帶已核對論點」的寫作 messages。
+
+    回 None＝這題不走證據流程（關閉、沒來源、抽取失敗、或一條都沒通過），
+    呼叫端退回原本的流程——那條路上仍有稽核重寫與忠實度關卡。
+    記一筆 evidence_quote_pass（通過率）：長期偏低代表模型不守「逐字複製」，要調抽取的 prompt。
+    """
+    if not settings.evidence_mode or not sources:
+        return None
+    progress.emit("stage", stage="evidence", text="正在從討論中擷取論點並核對原文…")
+    try:
+        items = evidence.extract(messages, ctx.tools, ctx.model)
+    except Exception as e:  # noqa: BLE001 — 抽不出來就走原本的流程
+        logger.warning("證據抽取失敗（退回原流程）：%s", e)
+        return None
+    progress.raise_if_cancelled()
+    ok, bad = evidence.verify(items, sources)
+    tracing.score("evidence_quote_pass", len(ok) / len(items) if items else 0.0,
+                  comment=f"{len(ok)}/{len(items)} 條引句對得上原文"
+                          + (f"；對不上：{evidence.pass_rate_comment(ok, bad)}" if bad else ""))
+    if not ok:
+        return None
+    return evidence.write_messages(messages, ok, sources, charts[-1] if charts else None)
+
+
 @observe(name="agent_loop", capture_input=False, capture_output=False)
 def run(user_message: str, history: list[dict] | None = None, session_id: str = "default",
         end_user_id: int | None = None) -> dict:
@@ -389,7 +418,12 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
     for _ in range(ctx.max_rounds):
         msg = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model)
         if not msg.tool_calls:
-            answer = _audit_retry(ctx, messages, msg.content or "", sources, used_tools)
+            answer = msg.content or ""
+            write = _evidence_messages(ctx, messages, sources, charts)
+            if write:
+                answer = chat_with_tools(write, ctx.tools, temperature=ctx.temperature,
+                                         model=ctx.model, tool_choice="none").content or answer
+            answer = _audit_retry(ctx, messages, answer, sources, used_tools)
             answer = _faithfulness_gate(ctx, messages, answer, sources,
                                         charts[-1] if charts else None)
             messages.append({"role": "assistant", "content": answer})
@@ -415,6 +449,10 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
     final = chat_with_tools(messages, ctx.tools, temperature=ctx.temperature, model=ctx.model,
                             tool_choice="none")
     answer = final.content or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
+    write = _evidence_messages(ctx, messages, sources, charts)
+    if write:
+        answer = chat_with_tools(write, ctx.tools, temperature=ctx.temperature,
+                                 model=ctx.model, tool_choice="none").content or answer
     answer = _audit_retry(ctx, messages, answer, sources, used_tools)
     answer = _faithfulness_gate(ctx, messages, answer, sources, charts[-1] if charts else None)
     messages.append({"role": "assistant", "content": answer})
@@ -424,25 +462,38 @@ def run(user_message: str, history: list[dict] | None = None, session_id: str = 
             "memories": ctx.memories}
 
 
-def _stream_once(ctx: _RunContext, messages: list[dict],
-                 tool_choice: str = "auto", emit_tokens: bool = True) -> tuple[dict, bool]:
+def _stream_once(ctx: _RunContext, messages: list[dict], tool_choice: str = "auto",
+                 emit_tokens: bool = True, stop_after_chars: int = 0) -> tuple[dict, bool]:
     """跑一次串流補全：token 邊收邊 emit。回 (assistant message dict, 是否吐過 token)。
 
     emit_tokens=False：照樣串流（取消檢查照常），但先不送到畫面——答案要先過稽核與
     忠實度關卡才能給使用者看（見 _verify_then_emit）。
+    stop_after_chars>0：文字累積到這麼多字就中斷，回 {"truncated": True}。給證據模式用——
+    模型開始寫答案就代表它不再叫工具了，而這份答案反正會被證據流程重寫，寫完是白等
+    （實測約 7 秒）。門檻不設成 1：少數模型叫工具前會先吐幾個字，太早停會誤判成答案。
     """
     streamed = False
     msg: dict = {}
-    for kind, payload in llm.chat_with_tools_stream(
-            messages, ctx.tools, temperature=ctx.temperature, model=ctx.model,
-            tool_choice=tool_choice):
-        if kind == "token":
-            if emit_tokens:
-                streamed = True
-                progress.emit("token", text=payload)
-        else:
-            msg = payload  # type: ignore[assignment]
+    text_len = 0
+    gen = llm.chat_with_tools_stream(messages, ctx.tools, temperature=ctx.temperature,
+                                     model=ctx.model, tool_choice=tool_choice)
+    try:
+        for kind, payload in gen:
+            if kind == "token":
+                text_len += len(payload)
+                if emit_tokens:
+                    streamed = True
+                    progress.emit("token", text=payload)
+                elif stop_after_chars and text_len >= stop_after_chars:
+                    return {"role": "assistant", "content": "", "truncated": True}, False
+            else:
+                msg = payload  # type: ignore[assignment]
+    finally:
+        gen.close()  # 提早 return 時也要關掉串流，底層 HTTP 連線才會中止
     return msg, streamed
+
+
+_EARLY_STOP_CHARS = 40  # 證據模式下，扣住的回合寫到這麼多字就判定是答案、提早中斷
 
 
 _EMIT_CHUNK = 20  # 核對完的答案分段送出，每段幾個字：前端照樣看到逐步長出來，前端程式不必改
@@ -467,6 +518,42 @@ def _verify_then_emit(ctx: _RunContext, messages: list[dict], answer: str,
     return answer
 
 
+def _finish_held(ctx: _RunContext, messages: list[dict], answer: str, sources: list[dict],
+                 used_tools: list[str], charts: list[dict], truncated: bool = False) -> str:
+    """串流版被扣住的答案怎麼送出，依開關三選一：
+
+    1) EVIDENCE_MODE 且證據流程成功 → 寫答案那一刀直接串流：素材已逐字核對過，
+       不必再扣住等關卡，第一個字反而比關卡早出現；
+    2) FAITH_GATE_STREAM → 先核對再分段送出（_verify_then_emit）；
+    3) 只開了 EVIDENCE_MODE 但證據流程退回 → 原答案直接分段送出（不多等）。
+
+    truncated：扣住的那一刀被提早中斷（見 _stream_once 的 stop_after_chars），手上沒有完整
+    答案——證據流程退回時要重新生成一份（不准再叫工具）。
+    """
+    write = _evidence_messages(ctx, messages, sources, charts)
+    if write:
+        progress.raise_if_cancelled()
+        msg, streamed = _stream_once(ctx, write, tool_choice="none")
+        text = msg.get("content") or answer
+        if not streamed:
+            progress.emit("token", text=text)
+        return text
+    if truncated:
+        if not settings.faith_gate_stream:  # 沒有關卡要過：重新生成時直接串流
+            msg, streamed = _stream_once(ctx, messages, tool_choice="none")
+            text = msg.get("content") or ""
+            if not streamed:
+                progress.emit("token", text=text)
+            return text
+        msg, _ = _stream_once(ctx, messages, tool_choice="none", emit_tokens=False)
+        answer = msg.get("content") or ""
+    if settings.faith_gate_stream:
+        return _verify_then_emit(ctx, messages, answer, sources, used_tools, charts)
+    for i in range(0, len(answer), _EMIT_CHUNK):
+        progress.emit("token", text=answer[i:i + _EMIT_CHUNK])
+    return answer
+
+
 @observe(name="agent_loop_streaming", capture_input=False, capture_output=False)
 def run_streaming(user_message: str, history: list[dict] | None = None,
                   session_id: str = "default", end_user_id: int | None = None) -> dict:
@@ -486,13 +573,15 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
         progress.raise_if_cancelled()
         # 已經查到來源的回合，這次吐出來的可能就是要引用來源的答案 → 先扣住、核對完再送。
         # 還沒查到來源（第一回合、常識題）照舊即時串流：沒有來源就沒有引用可核對。
-        hold = settings.faith_gate_stream and bool(sources)
-        msg, streamed = _stream_once(ctx, messages, emit_tokens=not hold)
+        hold = (settings.faith_gate_stream or settings.evidence_mode) and bool(sources)
+        early = _EARLY_STOP_CHARS if hold and settings.evidence_mode else 0
+        msg, streamed = _stream_once(ctx, messages, emit_tokens=not hold, stop_after_chars=early)
 
         if not msg.get("tool_calls"):  # 不需查（🟡 常識題）→ 剛剛串出去的就是答案
             answer = msg.get("content") or ""
             if hold:
-                answer = _verify_then_emit(ctx, messages, answer, sources, used_tools, charts)
+                answer = _finish_held(ctx, messages, answer, sources, used_tools, charts,
+                                      truncated=bool(msg.get("truncated")))
             elif not streamed:  # 模型沒串出東西（極少見）→ 補送一次，前端才有內容
                 progress.emit("token", text=answer)
             messages.append({"role": "assistant", "content": answer})
@@ -520,12 +609,14 @@ def run_streaming(user_message: str, history: list[dict] | None = None,
 
     progress.raise_if_cancelled()
     progress.emit("stage", stage="answering", text="讀完討論了，開始生成回答…")
-    hold = settings.faith_gate_stream and bool(sources)
+    hold = (settings.faith_gate_stream or settings.evidence_mode) and bool(sources)
     final, streamed = _stream_once(ctx, messages, tool_choice="none",  # 收尾：不准再叫工具
-                                   emit_tokens=not hold)
+                                   emit_tokens=not hold,
+                                   stop_after_chars=1 if hold and settings.evidence_mode else 0)
     answer = final.get("content") or "（已達工具呼叫上限，請換個問法或縮小範圍。）"
     if hold:
-        answer = _verify_then_emit(ctx, messages, answer, sources, used_tools, charts)
+        answer = _finish_held(ctx, messages, final.get("content") or "", sources, used_tools,
+                              charts, truncated=bool(final.get("truncated"))) or answer
     elif not streamed:
         progress.emit("token", text=answer)
     messages.append({"role": "assistant", "content": answer})
