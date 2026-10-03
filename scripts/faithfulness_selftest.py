@@ -82,6 +82,14 @@ LABELED: list[tuple[str, str, str, str]] = [
 
 def check_extract() -> int:
     fails = 0
+    answer = ("你問「大家覺得颱風假合理嗎？」。PTT 上有人說「台北人就是被罵慣了」。"
+              "續航被大家抱怨 [2]。攝氏 100 度等於華氏 212 度。")
+    got = fa.uncited_attributions(answer)
+    ok = got == ["PTT 上有人說「台北人就是被罵慣了」"]
+    print(f"{'OK  ' if ok else 'FAIL'} 沒標引用的網友說法｜只撈歸給網友、沒標引用、不是重述問題的句子")
+    if not ok:
+        fails += 1
+        print(f"       實得 {got}")
     for label, answer, expected in EXTRACT_CASES:
         got = [(c.text, c.cites) for c in fa.extract_claims(answer)]
         ok = got == expected
@@ -102,6 +110,54 @@ def check_remove() -> int:
         if not ok:
             fails += 1
             print(f"       預期 {expected!r}\n       實得 {got!r}")
+    return fails
+
+
+def check_judge_missing() -> int:
+    """judge 漏判時：只重判漏掉的；重判仍漏就整題標錯誤（不計分），不再當成 not_found。
+    以及被判有問題的論點會單獨重判（_recheck_flagged）。"""
+    import json as _json
+    srcs = [{"title": "", "content": "電池很耐用"}, {"title": "", "content": "價格偏貴"}]
+    answer = "有人說電池耐用 [1]。也有人嫌貴 [2]。"
+    replies = []
+
+    def fake_chat(msgs, temperature=0.0, model=None):
+        return replies.pop(0)
+
+    real = fa.chat
+    fa.chat = fake_chat
+    fails = 0
+    try:
+        replies[:] = [_json.dumps({"results": [{"id": 1, "verdict": "supported", "evidence": "電池很耐用"}]}),
+                      _json.dumps({"results": [{"id": 1, "verdict": "supported", "evidence": "價格偏貴"}]})]
+        r = fa.evaluate(answer, srcs)
+        ok = not r.error and [c.verdict for c in r.claims] == ["supported", "supported"]
+        print(f"{'OK  ' if ok else 'FAIL'} judge 漏判｜第一次漏一條，重判補回")
+        fails += not ok
+        replies[:] = [_json.dumps({"results": [{"id": 1, "verdict": "supported"}]}),
+                      _json.dumps({"results": []})]
+        r = fa.evaluate(answer, srcs)
+        ok = bool(r.error) and "漏判" in r.error
+        print(f"{'OK  ' if ok else 'FAIL'} judge 漏判｜重判仍漏，標成錯誤不計分")
+        fails += not ok
+        # 整批判 not_found 的那條單獨重判；單獨判說 supported 就以它為準，另一條維持原判
+        replies[:] = [_json.dumps({"results": [{"id": 1, "verdict": "not_found"},
+                                               {"id": 2, "verdict": "supported", "evidence": "價格偏貴"}]}),
+                      _json.dumps({"results": [{"id": 1, "verdict": "supported", "evidence": "電池很耐用"}]})]
+        r = fa.evaluate(answer, srcs)
+        ok = not r.error and [(c.verdict, c.method) for c in r.claims] == [
+            ("supported", "llm-recheck"), ("supported", "llm")]
+        print(f"{'OK  ' if ok else 'FAIL'} 單獨重判｜整批說 not_found、單獨判 supported → 採單獨判")
+        fails += not ok
+        replies[:] = [_json.dumps({"results": [{"id": 1, "verdict": "not_found"},
+                                               {"id": 2, "verdict": "supported"}]}),
+                      "壞掉的 JSON"]
+        r = fa.evaluate(answer, srcs)
+        ok = not r.error and r.claims[0].verdict == "not_found"
+        print(f"{'OK  ' if ok else 'FAIL'} 單獨重判｜重判失敗 → 維持 not_found")
+        fails += not ok
+    finally:
+        fa.chat = real
     return fails
 
 
@@ -127,10 +183,13 @@ def check_judge() -> int:
 
 def main() -> int:
     fails = check_extract()
-    print(f"\n拆論點：{len(EXTRACT_CASES) - fails}/{len(EXTRACT_CASES)} 通過\n")
+    print(f"\n拆論點：{len(EXTRACT_CASES) + 1 - fails}/{len(EXTRACT_CASES) + 1} 通過\n")
     removed = check_remove()
     print(f"\n刪句：{len(REMOVE_CASES) - removed}/{len(REMOVE_CASES)} 通過\n")
     fails += removed
+    missing = check_judge_missing()
+    print(f"\njudge 漏判與單獨重判：{4 - missing}/4 通過\n")
+    fails += missing
     if "--judge" in sys.argv:
         fails += check_judge()
         from app import tracing

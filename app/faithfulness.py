@@ -16,6 +16,7 @@
      判不準的一律交給下一關。沒裝就整批交給 LLM，結果一樣，只是比較貴。
   4) LLM-as-judge：剩下的論點一次打包成一個呼叫（不是一句一呼叫），temperature=0，
      輸出 supported / contradicted / not_found ＋ 原文依據句。
+     判成 not_found／contradicted 的論點再逐條單獨判一次（_recheck_flagged），以單獨判為準。
   5) 算分：supported ÷ 有效論點數。引用編號超出範圍的論點直接算不支持（指向不存在的來源）。
 
 線上抽樣（maybe_score_async）：依 FAITH_SAMPLE_RATE 抽題、在背景執行緒跑，結果以 score
@@ -29,6 +30,7 @@ import logging
 import random
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .config import settings
@@ -106,6 +108,31 @@ def extract_claims(answer: str) -> list[Claim]:
             start = run.end()
             if len(claim) >= _MIN_CLAIM_CHARS:
                 out.append(Claim(text=claim, cites=cites))
+    return out
+
+
+# 「把話說成是網友講的」的字眼。沒標引用的句子只要出現這些，就是在宣稱社群上有人這樣說。
+_ATTRIB = re.compile(r"網友|鄉民|有人|不少人|很多人|許多人|多數人|少數人|有些人|大家|"
+                     r"PTT|Dcard|Threads|推文|留言|原PO|原po|樓主|版友|板友|討論")
+_MIN_UNCITED_CHARS = 8
+# 開場重述使用者的問題（「你問『大家覺得……』」）不是在轉述網友
+_RESTATE = re.compile(r"^(?:你|妳|您)(?:問|想知道|好奇|提到)")
+
+
+def uncited_attributions(answer: str) -> list[str]:
+    """沒標任何引用、卻把內容歸給網友的句子（「PTT 上有人說……」但句子裡沒有 [n]）。
+
+    extract_claims 只拆有引用的論點，這類句子 faithfulness 完全看不到——
+    模型若把捏造的說法寫成不標引用的句子，分數照樣 100%。這裡把它們撈出來另外量。
+    """
+    text = _CITE_AFTER_STOP.sub(r"\2\1", answer or "")
+    out = []
+    for sent in _SENT_END.split(text):
+        if _CITE.search(sent):
+            continue
+        s = _BULLET.sub("", sent).replace("**", "").strip(" \t\n。！？!?，,、；;：:")
+        if len(s) >= _MIN_UNCITED_CHARS and _ATTRIB.search(s) and not _RESTATE.match(s):
+            out.append(s)
     return out
 
 
@@ -244,8 +271,12 @@ def _chart_note(chart: dict | None) -> str:
 
 
 @observe(name="faithfulness_judge", as_type="evaluator", capture_input=False)
-def _judge(claims: list[Claim], sources: list[dict], chart: dict | None = None) -> None:
-    """把 claims 一次交給 LLM 判斷，結果直接寫回每個 Claim。失敗就拋，由呼叫端決定怎麼處理。"""
+def _judge(claims: list[Claim], sources: list[dict], chart: dict | None = None) -> list[Claim]:
+    """把 claims 一次交給 LLM 判斷，結果直接寫回每個 Claim；回傳 judge 漏判的那幾條。
+
+    漏判的不再當 not_found：實測有一次 judge 只回了 1 條，其餘 16 條全被算成「原文沒提到」，
+    那題從 17/17 掉到 1/17——錯的是量測，不是答案。漏判的交給呼叫端重判。失敗就拋。
+    """
     cited = sorted({n for c in claims for n in c.cites})
     limit = _per_source_limit(len(cited))
     src_block = "\n\n".join(f"[{n}] {_source_text(sources[n - 1], limit)}" for n in cited)
@@ -258,13 +289,16 @@ def _judge(claims: list[Claim], sources: list[dict], chart: dict | None = None) 
     ], temperature=0.0)
     results = {int(r["id"]): r for r in _parse_json(raw).get("results", [])
                if isinstance(r, dict) and "id" in r}
+    missing = []
     for i, c in enumerate(claims, 1):
         r = results.get(i) or {}
         verdict = str(r.get("verdict", "")).strip().lower()
-        # judge 漏回或回了清單外的值：當 not_found——寧可低估也不要把沒判到的算成支持
-        c.verdict = verdict if verdict in _VERDICTS else NOT_FOUND
-        c.method = "llm"
+        if verdict not in _VERDICTS:
+            missing.append(c)   # 漏回或回了清單外的值：留空，交給呼叫端重判
+            continue
+        c.verdict, c.method = verdict, "llm"
         c.evidence = str(r.get("evidence") or "")[:200]
+    return missing
 
 
 # ---- 5) 組起來 ---------------------------------------------------------------
@@ -289,11 +323,49 @@ def evaluate(answer: str, sources: list[dict] | None, chart: dict | None = None)
         pending.append(c)
     if pending:
         try:
-            _judge(pending, sources, chart)
+            missing = _judge(pending, sources, chart)
+            if missing:  # 只重判漏掉的那幾條；論點少了，judge 也比較不會再漏
+                missing = _judge(missing, sources, chart)
+            if missing:  # 還是漏：這題的分數不可信，標成錯誤（不計分、關卡放行），不猜
+                result.error = f"judge 漏判 {len(missing)} 條論點"
+                logger.warning("faithfulness judge 漏判 %d 條（已重判一次）", len(missing))
+            elif len(pending) > 1:
+                _recheck_flagged(pending, sources, chart)
         except Exception as e:  # noqa: BLE001 — judge 壞掉：結果標成不可信，不猜
             logger.warning("faithfulness judge 失敗：%s", e)
             result.error = str(e)
     return result
+
+
+def _recheck_flagged(claims: list[Claim], sources: list[dict], chart: dict | None) -> None:
+    """整批判成 not_found／contradicted 的論點，逐條再單獨判一次，以單獨判的結果為準。
+
+    整批判會誤判兩種情況（2026-10 拆防線實驗，4 條「錯誤」全是 judge 看錯、答案其實沒錯）：
+      - 原文被截短：一次引用 8 則時每則只讀 3750 字，支持的段落在第 4300 字（p02）；
+        單獨判時只引用 1 則，可讀到 8000 字。
+      - 論點多時看漏：原文沒被截（1900 字），13 條一起判時 5 次都說 not_found，
+        單獨判 3 次都是 supported（r01）。
+    放行關卡用的也是這個 judge，不重判就會把正確的句子刪掉。被抓的通常每題 0～2 條，加成本很小。
+    單獨重判失敗或漏回就維持原判（寧可多擋，不要少擋）。
+    """
+    flagged = [c for c in claims if c.method == "llm" and c.verdict in (NOT_FOUND, CONTRADICTED)]
+    if not flagged:
+        return
+
+    def one(c: Claim) -> None:
+        solo = Claim(c.text, c.cites)
+        try:
+            if _judge([solo], sources, chart):
+                return
+        except Exception as e:  # noqa: BLE001
+            logger.warning("faithfulness 單獨重判失敗，維持原判：%s", e)
+            return
+        if solo.verdict != c.verdict:
+            c.verdict, c.evidence = solo.verdict, solo.evidence
+        c.method = "llm-recheck"
+
+    with ThreadPoolExecutor(max_workers=min(4, len(flagged))) as pool:
+        list(pool.map(one, flagged))
 
 
 def _comment(res: Result) -> str | None:
@@ -330,3 +402,60 @@ def maybe_score_async(answer: str, sources: list[dict] | None,
             logger.warning("faithfulness 抽樣評分失敗（略過）：%s", e)
 
     threading.Thread(target=work, name="faithfulness", daemon=True).start()
+
+
+# ---- 6) 沒標引用的網友說法 ---------------------------------------------------------
+UNCITED_FOUND, UNCITED_SUMMARY, UNCITED_NOT_FOUND = "found", "summary", "not_found"
+_UNCITED_SYSTEM = (
+    "你是嚴謹的事實查核員。下面有一批社群貼文（原文，有編號）與幾個從某篇回答中挑出的句子。"
+    "這些句子沒有標引用，但都把內容歸給網友或某個平台。請逐句判斷：\n"
+    "- found：句子講的是具體說法，而且在某幾則原文裡找得到（ids 列出編號）。\n"
+    "- summary：句子只是整體概述（例如「大家看法兩極」「討論很熱烈」），不是具體說法，"
+    "且與原文整體方向不衝突。\n"
+    "- not_found：句子講的是具體說法（尤其是引號裡的原話、具體理由或細節），"
+    "但整批原文都找不到，或與原文相反。\n"
+    "- 說「原文裡沒有人這樣講」這類否定句，原文確實沒有就算 found。\n"
+    "原文是鄉民口語，要依實際意思理解；不要用你自己的常識補。\n"
+    "只輸出 JSON，不要 markdown：\n"
+    "{\"results\":[{\"id\":1,\"verdict\":\"found|summary|not_found\",\"ids\":[3]}]}"
+)
+
+
+@dataclass
+class Uncited:
+    text: str
+    verdict: str = ""        # found / summary / not_found；judge 失敗留空
+    ids: list[int] = field(default_factory=list)
+
+
+def check_uncited(answer: str, sources: list[dict] | None,
+                  chart: dict | None = None) -> list[Uncited]:
+    """量測用：沒標引用的網友說法，到底是在原文找得到、只是概述、還是憑空多出來的。
+
+    不像 evaluate 有引用編號可以只看那幾則，這裡得把整批原文都給 judge，
+    所以每則原文更短（FAITH_SOURCE_BUDGET 平均分給全部來源）——判成 not_found 的
+    要人工抽看，可能是原文被截掉。只在離線評測用，不接進關卡。失敗回傳 verdict 留空的清單。
+    """
+    items = [Uncited(s) for s in uncited_attributions(answer)]
+    sources = sources or []
+    if not items or not sources:
+        return items
+    limit = max(300, settings.faith_source_budget // len(sources))
+    src_block = "\n\n".join(f"[{i}] {_source_text(s, limit)}" for i, s in enumerate(sources, 1))
+    sent_block = "\n".join(f"{i}. {u.text}" for i, u in enumerate(items, 1))
+    try:
+        raw = chat([{"role": "system", "content": _UNCITED_SYSTEM + _chart_note(chart)},
+                    {"role": "user", "content": f"【原文】\n{src_block}\n\n【句子】\n{sent_block}"}],
+                   temperature=0.0)
+        results = {int(r["id"]): r for r in _parse_json(raw).get("results", [])
+                   if isinstance(r, dict) and "id" in r}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("沒標引用的網友說法：judge 失敗：%s", e)
+        return items
+    for i, u in enumerate(items, 1):
+        r = results.get(i) or {}
+        v = str(r.get("verdict", "")).strip().lower()
+        if v in (UNCITED_FOUND, UNCITED_SUMMARY, UNCITED_NOT_FOUND):
+            u.verdict = v
+            u.ids = [int(n) for n in r.get("ids") or [] if str(n).isdigit()]
+    return items
