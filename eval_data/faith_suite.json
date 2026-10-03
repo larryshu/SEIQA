@@ -1,0 +1,51 @@
+{
+  "version": 2,
+  "description": "faithfulness 評測題庫 v2：單輪 9 題沿用舊題庫；追問、政治反諷、小眾與英文品牌、曾經出錯的真實對話各自成類。每題的 turns 依序送出，評的是每一輪答案引用的原文是否支持論點。",
+  "categories": {
+    "single": "單輪（沿用 v1 的 9 題，可與舊結果比較）",
+    "followup": "追問、多輪：第 2 輪沿用上一輪貼文（畫圖、占比、指定平台、縮小範圍）",
+    "political": "政治與爭議議題：反諷多、立場對立，最容易誤讀原文",
+    "niche": "小眾、資料少、英文品牌名：測「查不到就誠實說」與平台資料量落差",
+    "regression": "曾經出錯的真實對話：引用錯置、編號超出範圍、曲解原文"
+  },
+  "items": [
+    {"id": "s01", "category": "single", "turns": ["大家覺得台北那次颱風假放得合理嗎？"]},
+    {"id": "s02", "category": "single", "turns": ["輝達進駐北士科，網友怎麼看？"]},
+    {"id": "s03", "category": "single", "turns": ["福智教育園區的評價如何？"]},
+    {"id": "s04", "category": "single", "turns": ["最近外送平台漲價，大家反應怎樣？"]},
+    {"id": "s05", "category": "single", "turns": ["換工作到新創公司，過來人的心得如何？"]},
+    {"id": "s06", "category": "single", "turns": ["大家都推薦哪家的除濕機？"]},
+    {"id": "s07", "category": "single", "turns": ["新竹有什麼推薦的餐廳？"]},
+    {"id": "s08", "category": "single", "turns": ["遠端工作大家實際適應得如何？"]},
+    {"id": "s09", "category": "single", "turns": ["ChatGPT 和 Claude 哪個比較好用？"]},
+
+    {"id": "f01", "category": "followup", "turns": ["遠端工作大家實際適應得如何？", "以上網友的立場占比為何？請畫圖"]},
+    {"id": "f02", "category": "followup", "turns": ["請問網友對於慈濟被詐騙10億的事有討論如何？", "網友對於以上這事件看法占比如何？（用圖表示）"]},
+    {"id": "f03", "category": "followup", "turns": ["網友對於 Kimi K3 評價如何？", "鄉民對 Kimi K3 合規爭議有什麼看法？"]},
+    {"id": "f04", "category": "followup", "turns": ["網友對於福智這團體評價如何？", "請用圖表畫出來各方立場意見"]},
+    {"id": "f05", "category": "followup", "turns": ["大家覺得台北那次颱風假放得合理嗎？", "那 PTT 上的看法呢？"]},
+    {"id": "f06", "category": "followup", "turns": ["大家都推薦哪家的除濕機？", "那預算三千以內網友推薦哪台？"]},
+    {"id": "f07", "category": "followup", "turns": ["ChatGPT 和 Claude 哪個比較好用？", "如果是寫程式，網友比較推哪個？"]},
+    {"id": "f08", "category": "followup", "turns": ["網友對於 OpenAI 自主越獄有什麼看法？", "網友對於以上這事件看法占比如何？（用圖表示）"]},
+
+    {"id": "p01", "category": "political", "turns": ["請問網友認為國民黨鄭麗文主席是否是中共派來的？或是想暗助民進黨？"]},
+    {"id": "p02", "category": "political", "turns": ["鄉民怎麼看川普關稅對台灣的影響？"]},
+    {"id": "p03", "category": "political", "turns": ["網友怎麼看柯文哲案的判決？"]},
+    {"id": "p04", "category": "political", "turns": ["網友對健保費調漲有什麼看法？"]},
+    {"id": "p05", "category": "political", "turns": ["網友怎麼看台灣核電重啟的討論？"]},
+
+    {"id": "n01", "category": "niche", "turns": ["Cursor 和 VS Code Copilot 寫程式哪個好用？"]},
+    {"id": "n02", "category": "niche", "turns": ["Notion 跟 Obsidian 筆記軟體網友推薦哪個？"]},
+    {"id": "n03", "category": "niche", "turns": ["台東池上便當網友評價如何？"]},
+    {"id": "n04", "category": "niche", "turns": ["網友對 Kimi K3 被指控知識蒸餾竊取 Anthropic 有什麼看法？"]},
+
+    {"id": "r01", "category": "regression", "note": "追問畫圖時編號重排、模型沿用舊編號（修正前 0/3）",
+     "turns": ["請問最近有談論到 AI 末日論這個事件嗎？網友們對於這些軟體大佬的說法感覺如何？", "想請問以上網友對於 AI 末日相關討論風向占比，可以畫圖出來嗎？"]},
+    {"id": "r02", "category": "regression", "note": "追問時引用了超出範圍的編號（bad_citation）",
+     "turns": ["張凌赫、肖戰和楊洋這三位網友評論如何？哪個綜合評價最高？", "他們在不同年齡層的受歡迎程度如何？"]},
+    {"id": "r03", "category": "regression", "note": "直接寫答案時把 Codex 做的事說成 Claude Code（曲解原文）",
+     "turns": ["Claude Code 和 Codex 寫程式哪個好？"]},
+    {"id": "r04", "category": "regression", "note": "追問要求推估數字，容易出現沒有來源的比例",
+     "turns": ["輝達進駐北士科，網友怎麼看？", "輝達進駐後，科技業工作機會會增加多少？"]}
+  ]
+}

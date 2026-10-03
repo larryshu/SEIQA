@@ -30,3 +30,7 @@ DRF_能力分級對照專案功能.MD
 # 本機開發工具設定
 .claude/
 admin_backend/preferences/migrations/
+
+# faithfulness 評測的貼文快照與結果（爬自公開社群的原文，只留在本機）
+eval_data/snapshots/
+eval_data/results/

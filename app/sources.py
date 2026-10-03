@@ -221,9 +221,13 @@ class SearchResult(NamedTuple):
     platforms: list[tuple[str, str]]
 
 
-@observe(name="fanout", capture_input=False, capture_output=False)
-def community_search(query: str, end_user_id: int | None = None) -> SearchResult:
-    """並行 fan-out 到所有啟用來源（套使用者平台偏好），依順序合併（每篇已帶 source 平台標籤）。"""
+def _fanout(query: str, end_user_id: int | None = None) -> SearchResult:
+    """並行爬所有啟用的平台，依順序合併；回「重排之前」的原始結果與平台清單。
+
+    獨立成一支是為了評測：scripts/faithfulness_eval.py 錄製時把這裡的回傳存成快照，
+    重播時直接換成快照——後面的 reranker、證據模式、關卡都照常跑，只是不再爬蟲。
+    這樣 A/B 兩組讀的是同一批原文，而且一題從幾分鐘降到幾十秒。
+    """
     registry = _build_registry(end_user_id)
     progress.emit("search_start", query=query, platforms=[s.name for s in registry])
 
@@ -247,6 +251,13 @@ def community_search(query: str, end_user_id: int | None = None) -> SearchResult
         # 取消時不等在途的爬蟲：DrissionPage 是阻塞的、無法從外部中斷，只能不再等它。
         # 那顆 Chrome 會自己跑到時間預算結束後收工，結果丟棄。
         executor.shutdown(wait=False, cancel_futures=True)
+    return SearchResult(results, [(s.name, s.label) for s in registry])
+
+
+@observe(name="fanout", capture_input=False, capture_output=False)
+def community_search(query: str, end_user_id: int | None = None) -> SearchResult:
+    """並行 fan-out 到所有啟用來源（套使用者平台偏好），合併後重排（每篇已帶 source 平台標籤）。"""
+    results, platforms = _fanout(query, end_user_id)
 
     # 合併後才重排：這裡是三個平台唯一的匯流點，而且還沒編號——之後的 [n]、
     # 「哪些平台有資料」的提示、立場統計，全都自動用重排後的結果。關閉時原樣返回。
@@ -261,5 +272,5 @@ def community_search(query: str, end_user_id: int | None = None) -> SearchResult
     # 每個平台各撈到幾則，是判斷「哪一邊該調門檻」最直接的數字（某平台長期回 0
     # 通常不是沒討論，而是抽詞或語意門檻的問題）。
     tracing.set_span(input=query, output={"total": len(results), "counts": counts},
-                     metadata={"platforms": [s.name for s in registry]})
-    return SearchResult(results, [(s.name, s.label) for s in registry])
+                     metadata={"platforms": [name for name, _ in platforms]})
+    return SearchResult(results, platforms)
