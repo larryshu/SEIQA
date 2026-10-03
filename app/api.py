@@ -374,8 +374,11 @@ async def _stream_one(ws: WebSocket, msg: dict, end_user_id: int | None,
             await ws.send_json(event)
             if event["type"] in _TERMINAL_EVENTS:
                 break
-    except WebSocketDisconnect:
-        cancel_event.set()  # 人都走了，別讓爬蟲白跑
+    except (WebSocketDisconnect, RuntimeError):
+        # 人都走了，別讓爬蟲白跑。對已關閉的連線 send，uvicorn 丟的是 RuntimeError
+        # （"Unexpected ASGI message 'websocket.send', after sending 'websocket.close'"）
+        # 而不是 WebSocketDisconnect——常見於 reader 先收到斷線、worker 隨後才送 cancelled/done。
+        cancel_event.set()
     finally:
         # worker 一定會送終結事件後返回；被取消時受檢查點約束（最多再等一篇貼文）
         await worker
